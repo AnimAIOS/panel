@@ -15,12 +15,17 @@
 //! - State updates are sent to the GTK main loop via `glib::idle_add_once()`
 //!   which wakes the main loop immediately (no polling required)
 //! - Volume/mute commands are sent to the background thread via `std::sync::mpsc`
+//! - Device changes are event-driven (sink/source/card subscriptions) with a
+//!   low-frequency full refresh as a safety net for missed events
+//! - When the connection to PipeWire/PulseAudio is lost, the worker tears the
+//!   session down and reconnects automatically, so the panel survives audio
+//!   server restarts without being restarted itself
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
 use parking_lot::Mutex;
 use std::thread;
@@ -468,9 +473,18 @@ impl AudioService {
     }
 
     fn apply_state_update(&self, new_snapshot: AudioSnapshot) {
-        if *self.current.borrow() == new_snapshot {
-            return;
-        }
+        let devices_changed = {
+            let current = self.current.borrow();
+            if *current == new_snapshot {
+                return;
+            }
+
+            current.available != new_snapshot.available
+                || current.sinks != new_snapshot.sinks
+                || current.sources != new_snapshot.sources
+                || current.default_sink_name != new_snapshot.default_sink_name
+                || current.default_source_name != new_snapshot.default_source_name
+        };
 
         // Update state and mark as ready.
         *self.current.borrow_mut() = new_snapshot.clone();
@@ -478,6 +492,17 @@ impl AudioService {
             self.ready.set(true);
             self.ready_at.set(Some(Instant::now()));
             debug!("AudioService: ready (connected to PulseAudio)");
+        }
+
+        if devices_changed {
+            debug!(
+                "AudioService: devices updated (available={}, sinks={}, sources={}, default_sink={:?}, default_source={:?})",
+                new_snapshot.available,
+                new_snapshot.sinks.len(),
+                new_snapshot.sources.len(),
+                new_snapshot.default_sink_name,
+                new_snapshot.default_source_name
+            );
         }
 
         self.callbacks.notify(&new_snapshot);
@@ -650,13 +675,103 @@ struct PendingAppVolume {
     revision: u64,
 }
 
-/// Main function for the PulseAudio worker thread.
+/// How often the worker checks the PulseAudio connection while idle.
+///
+/// This also bounds how quickly the panel notices that PipeWire or
+/// PulseAudio went away.
+const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Interval between background full refreshes of the audio device lists.
+///
+/// Subscription events normally keep the lists current. This periodic
+/// reconciliation catches device changes that are not announced through the
+/// facilities we subscribe to, or events that were missed.
+const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Delay before reconnecting after the audio server connection is lost.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// Maximum time to wait for a new context to become ready before retrying.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why a PulseAudio session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    /// A shutdown was requested or the command channel disconnected.
+    Stop,
+    /// The context never reached the ready state.
+    ConnectFailed,
+    /// The context was ready and then failed or terminated.
+    ConnectionLost,
+}
+
+/// Main entry point for the PulseAudio worker thread.
+///
+/// Runs PulseAudio sessions until a shutdown is requested. A failed or
+/// dropped connection is retried with a fresh mainloop and context, so the
+/// panel follows PipeWire/PulseAudio restarts without being restarted.
 fn pulse_worker_thread(command_rx: Receiver<AudioCommand>) {
+    let mut queued_commands = Vec::new();
+
+    loop {
+        match pulse_session(&command_rx, &mut queued_commands) {
+            SessionEnd::Stop => break,
+            SessionEnd::ConnectFailed => {
+                debug!("AudioService: audio server unavailable; retrying");
+            }
+            SessionEnd::ConnectionLost => {
+                warn!("AudioService: audio server connection lost; reconnecting");
+            }
+        }
+
+        // Publish an unavailable snapshot so widgets stop showing stale
+        // devices and controls while the connection is down.
+        send_state_update(&PulseWorkerState::default());
+
+        if wait_before_retry(&command_rx, &mut queued_commands, RECONNECT_DELAY) {
+            break;
+        }
+    }
+
+    debug!("AudioService: worker thread exited");
+}
+
+/// Wait before the next connection attempt.
+///
+/// Commands received while waiting are kept so they can be replayed on the
+/// new session. Returns `true` when a shutdown was requested.
+fn wait_before_retry(
+    command_rx: &Receiver<AudioCommand>,
+    queued_commands: &mut Vec<AudioCommand>,
+    delay: Duration,
+) -> bool {
+    let deadline = Instant::now() + delay;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+
+        match command_rx.recv_timeout(remaining) {
+            Ok(AudioCommand::Shutdown) => return true,
+            Ok(cmd) => queued_commands.push(cmd),
+            Err(RecvTimeoutError::Timeout) => return false,
+            Err(RecvTimeoutError::Disconnected) => return true,
+        }
+    }
+}
+
+/// Run one PulseAudio session until shutdown or connection loss.
+fn pulse_session(
+    command_rx: &Receiver<AudioCommand>,
+    queued_commands: &mut Vec<AudioCommand>,
+) -> SessionEnd {
     let mainloop = match Mainloop::new() {
         Some(ml) => ml,
         None => {
             error!("AudioService: failed to create PulseAudio mainloop");
-            return;
+            return SessionEnd::ConnectFailed;
         }
     };
 
@@ -675,7 +790,7 @@ fn pulse_worker_thread(command_rx: Receiver<AudioCommand>) {
         Some(ctx) => ctx,
         None => {
             error!("AudioService: failed to create PulseAudio context");
-            return;
+            return SessionEnd::ConnectFailed;
         }
     };
 
@@ -692,7 +807,7 @@ fn pulse_worker_thread(command_rx: Receiver<AudioCommand>) {
         let mut ml = mainloop.lock();
         if ml.start().is_err() {
             error!("AudioService: failed to start PulseAudio mainloop");
-            return;
+            return SessionEnd::ConnectFailed;
         }
     }
 
@@ -704,31 +819,32 @@ fn pulse_worker_thread(command_rx: Receiver<AudioCommand>) {
         if ctx.connect(None, ContextFlagSet::NOFLAGS, None).is_err() {
             error!("AudioService: failed to connect to PulseAudio server");
             ml.unlock();
-            return;
+            ml.stop();
+            return SessionEnd::ConnectFailed;
         }
 
         ml.unlock();
     }
 
-    // Wait for the context to be ready.
-    loop {
-        let ctx_state = {
-            let mut ml = mainloop.lock();
-            ml.lock();
-            let ctx = context.lock();
-            let s = ctx.get_state();
-            ml.unlock();
-            s
-        };
+    // Wait for the context to be ready, but do not hang forever if the
+    // server accepts the connection and then stops responding.
+    let connect_deadline = Instant::now() + CONNECT_TIMEOUT;
 
-        match ctx_state {
+    loop {
+        match context_state(&mainloop, &context) {
             ContextState::Ready => {
                 info!("AudioService: connected to PulseAudio");
                 break;
             }
             ContextState::Failed | ContextState::Terminated => {
                 error!("AudioService: PulseAudio connection failed");
-                return;
+                disconnect_session(&mainloop, &context);
+                return SessionEnd::ConnectFailed;
+            }
+            _ if Instant::now() >= connect_deadline => {
+                warn!("AudioService: timed out connecting to PulseAudio");
+                disconnect_session(&mainloop, &context);
+                return SessionEnd::ConnectFailed;
             }
             _ => {
                 // Still connecting; wait a bit.
@@ -751,15 +867,26 @@ fn pulse_worker_thread(command_rx: Receiver<AudioCommand>) {
         Arc::clone(&state),
     );
 
-    // Main command loop.
+    // Replay commands that arrived while the previous session was down.
+    for cmd in queued_commands.drain(..) {
+        handle_command(
+            cmd,
+            Arc::clone(&mainloop),
+            Arc::clone(&context),
+            Arc::clone(&state),
+        );
+    }
+
+    let mut last_refresh = Instant::now();
+
+    // Main command loop. Wake periodically so connection loss and the
+    // fallback refresh are handled even when no commands arrive.
     loop {
-        // Block on commands - no polling needed.
-        // PulseAudio disconnection will be detected when user tries to interact,
-        // or via the subscription callback if the server sends a disconnect event.
-        match command_rx.recv() {
+        match command_rx.recv_timeout(CONNECTION_CHECK_INTERVAL) {
             Ok(AudioCommand::Shutdown) => {
                 debug!("AudioService: worker thread shutting down");
-                break;
+                disconnect_session(&mainloop, &context);
+                return SessionEnd::Stop;
             }
             Ok(cmd) => {
                 handle_command(
@@ -769,23 +896,60 @@ fn pulse_worker_thread(command_rx: Receiver<AudioCommand>) {
                     Arc::clone(&state),
                 );
             }
-            Err(mpsc::RecvError) => {
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
                 debug!("AudioService: command channel disconnected");
-                break;
+                disconnect_session(&mainloop, &context);
+                return SessionEnd::Stop;
             }
         }
-    }
 
-    {
-        let mut ml = mainloop.lock();
-        ml.lock();
-        let mut ctx = context.lock();
-        ctx.disconnect();
-        ml.unlock();
-        ml.stop();
-    }
+        // Detect PipeWire/PulseAudio restarts promptly instead of waiting
+        // for a user interaction to fail.
+        match context_state(&mainloop, &context) {
+            ContextState::Ready => {}
+            ContextState::Failed | ContextState::Terminated => {
+                warn!("AudioService: PulseAudio connection dropped; reconnecting");
+                disconnect_session(&mainloop, &context);
+                return SessionEnd::ConnectionLost;
+            }
+            _ => continue,
+        }
 
-    debug!("AudioService: worker thread exited");
+        // Fallback reconciliation for device changes that did not deliver a
+        // subscription event. Identical snapshots are deduplicated before
+        // reaching the UI, so this is cheap when nothing changed.
+        if last_refresh.elapsed() >= DEVICE_REFRESH_INTERVAL {
+            fetch_full_state(
+                Arc::clone(&mainloop),
+                Arc::clone(&context),
+                Arc::clone(&state),
+            );
+            last_refresh = Instant::now();
+        }
+    }
+}
+
+/// Read the current PulseAudio context state.
+///
+/// The threaded mainloop lock is required for all PulseAudio objects.
+fn context_state(mainloop: &Arc<Mutex<Mainloop>>, context: &Arc<Mutex<Context>>) -> ContextState {
+    let mut ml = mainloop.lock();
+    ml.lock();
+    let ctx = context.lock();
+    let state = ctx.get_state();
+    ml.unlock();
+    state
+}
+
+/// Disconnect the context and stop the mainloop thread.
+fn disconnect_session(mainloop: &Arc<Mutex<Mainloop>>, context: &Arc<Mutex<Context>>) {
+    let mut ml = mainloop.lock();
+    ml.lock();
+    let mut ctx = context.lock();
+    ctx.disconnect();
+    ml.unlock();
+    ml.stop();
 }
 
 fn setup_subscriptions(
@@ -806,7 +970,7 @@ fn setup_subscriptions(
         let Some(facility) = facility else { return };
         let Some(op) = op else { return };
 
-        // We care about sink, source, sink-input, and server changes.
+        // We care about sink, source, sink-input, server, and card changes.
         // Note: We're inside a callback, so the mainloop is already locked.
         // We must NOT call mainloop.lock() or ml.lock() here.
         match facility {
@@ -838,15 +1002,22 @@ fn setup_subscriptions(
                 // Server info changed (e.g., default sink changed).
                 fetch_full_state_inner(Arc::clone(&context_for_cb), Arc::clone(&state_for_cb));
             }
+            Facility::Card => {
+                // Hardware hotplug and profile switches are reported on the
+                // card. Refresh everything because a new profile can add or
+                // remove sinks, sources, and ports at once.
+                fetch_full_state_inner(Arc::clone(&context_for_cb), Arc::clone(&state_for_cb));
+            }
             _ => {}
         }
     })));
 
-    // Subscribe to sink, source, sink-input, and server events.
+    // Subscribe to sink, source, sink-input, server, and card events.
     let mask = InterestMaskSet::SINK
         | InterestMaskSet::SOURCE
         | InterestMaskSet::SINK_INPUT
-        | InterestMaskSet::SERVER;
+        | InterestMaskSet::SERVER
+        | InterestMaskSet::CARD;
     ctx.subscribe(mask, |_success| {});
 
     ml.unlock();
@@ -1225,14 +1396,10 @@ fn is_application_sink_input(info: &SinkInputInfo<'_>) -> bool {
     }
 
     let media_role = sink_input_prop(info, "media.role").unwrap_or_default();
-    if matches!(
+    !matches!(
         media_role.as_str(),
         "filter" | "abstract" | "test" | "event"
-    ) {
-        return false;
-    }
-
-    true
+    )
 }
 
 /// Fetch the default sink state (called from command handler, locks mainloop).
@@ -2481,5 +2648,45 @@ mod tests {
         assert_eq!(state.mic_volume, None);
         assert_eq!(state.mic_channel_count, 0);
         assert!(!state.mic_control_available);
+    }
+
+    #[test]
+    fn retry_wait_queues_commands_until_deadline() {
+        let (tx, rx) = mpsc::channel();
+        let mut queued = Vec::new();
+
+        tx.send(AudioCommand::SetVolume(42)).unwrap();
+        tx.send(AudioCommand::ToggleMute).unwrap();
+
+        assert!(!wait_before_retry(
+            &rx,
+            &mut queued,
+            Duration::from_millis(20)
+        ));
+
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(queued[0], AudioCommand::SetVolume(42)));
+        assert!(matches!(queued[1], AudioCommand::ToggleMute));
+    }
+
+    #[test]
+    fn retry_wait_stops_on_shutdown() {
+        let (tx, rx) = mpsc::channel();
+        let mut queued = Vec::new();
+
+        tx.send(AudioCommand::Shutdown).unwrap();
+
+        assert!(wait_before_retry(&rx, &mut queued, Duration::from_secs(1)));
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn retry_wait_stops_when_channel_closes() {
+        let (tx, rx) = mpsc::channel::<AudioCommand>();
+        drop(tx);
+
+        let mut queued = Vec::new();
+        assert!(wait_before_retry(&rx, &mut queued, Duration::from_secs(1)));
+        assert!(queued.is_empty());
     }
 }
