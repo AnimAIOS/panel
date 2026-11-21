@@ -22,3 +22,10 @@ target
 
 # Full Material Symbols font (downloaded on demand by scripts/subset-font.sh)
 assets/fonts/MaterialSymbolsRounded-full.ttf
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
