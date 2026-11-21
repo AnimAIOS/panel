@@ -2376,7 +2376,7 @@ mod tests {
         let config: Config = toml::from_str(toml).unwrap();
 
         let unreferenced = config.widgets.unreferenced_configs();
-        assert!(unreferenced.contains(&"clokc".to_string()));
+        assert!(unreferenced.iter().any(|i| i == "clokc"));
     }
 
     #[test]

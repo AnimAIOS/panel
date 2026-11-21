@@ -1064,10 +1064,7 @@ impl ConfigManager {
         // Watch both the logical and canonical parent directories (more reliable than
         // watching the file directly). They differ once config.toml links elsewhere.
         for dir in &config_watch_dirs {
-            if let Err(e) = debouncer
-                .watcher()
-                .watch(dir, RecursiveMode::NonRecursive)
-            {
+            if let Err(e) = debouncer.watcher().watch(dir, RecursiveMode::NonRecursive) {
                 error!("Failed to watch config directory {}: {}", dir.display(), e);
                 return;
             }
@@ -1095,7 +1092,9 @@ impl ConfigManager {
                 let newly_armed: HashSet<PathBuf> = desired_config_dirs
                     .difference(&config_watch_dirs)
                     .filter(|dir| {
-                        match debouncer.watcher().watch(dir.as_path(), RecursiveMode::NonRecursive)
+                        match debouncer
+                            .watcher()
+                            .watch(dir.as_path(), RecursiveMode::NonRecursive)
                         {
                             Ok(()) => {
                                 info!("Config symlink target changed; watching: {}", dir.display());

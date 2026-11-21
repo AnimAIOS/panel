@@ -726,7 +726,9 @@ pub(super) mod tests {
 
         let hover = declarations(&css, hover_selector);
         assert!(
-            hover.contains(&"background: var(--color-card-overlay-hover)".to_string()),
+            hover
+                .iter()
+                .any(|i| i == "background: var(--color-card-overlay-hover)"),
             "{hover_selector}: {hover:?}"
         );
         let chrome = declarations(&css, chrome_selector);
@@ -737,7 +739,7 @@ pub(super) mod tests {
             "box-shadow: none",
         ] {
             assert!(
-                chrome.contains(&expected.to_string()),
+                chrome.iter().any(|i| i == expected),
                 "{chrome_selector}: missing {expected}"
             );
         }
@@ -770,7 +772,9 @@ pub(super) mod tests {
             ".notification-toast, window.media-window > .media-content, .osd",
         ] {
             assert!(
-                declarations(&css, selector).contains(&"background-clip: padding-box".to_string()),
+                declarations(&css, selector)
+                    .iter()
+                    .any(|i| i == "background-clip: padding-box"),
                 "{selector}"
             );
         }

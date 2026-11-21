@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Hiddify (root)
+GenericName=Hiddify
+Comment=Hiddify launched as root, with its system tray icon working
+Exec=run-as-root-with-tray hiddify
+Icon=hiddify
+Terminal=false
+StartupNotify=true
+Categories=Network;
+Keywords=Hiddify;Proxy;VPN;V2ray;Nekoray;Xray;Psiphon;OpenVPN;AntiCensorship;

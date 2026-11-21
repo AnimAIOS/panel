@@ -695,14 +695,20 @@ mod tests {
         let mut good = Snapshot::default();
         good.insert("eDP-1".into(), OutputWindows::default());
 
-        assert!(VisibilityReader::publish_result(&snapshot, Some(good.clone())));
+        assert!(VisibilityReader::publish_result(
+            &snapshot,
+            Some(good.clone())
+        ));
         assert_eq!(*snapshot.read(), good);
 
         // A transient IPC failure reads as `None` and must not clear good state.
         assert!(!VisibilityReader::publish_result(&snapshot, None));
         assert_eq!(*snapshot.read(), good);
         // Repeating the same good snapshot is not a change.
-        assert!(!VisibilityReader::publish_result(&snapshot, Some(good.clone())));
+        assert!(!VisibilityReader::publish_result(
+            &snapshot,
+            Some(good.clone())
+        ));
     }
 
     #[test]

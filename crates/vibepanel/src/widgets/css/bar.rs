@@ -842,7 +842,9 @@ mod tests {
         let css = css(0, 0, false);
         for selector in ["sectioned-bar.bar", ".widget"] {
             assert!(
-                declarations(&css, selector).contains(&"background-clip: padding-box".to_string()),
+                declarations(&css, selector)
+                    .iter()
+                    .any(|i| i == "background-clip: padding-box"),
                 "{selector}"
             );
         }

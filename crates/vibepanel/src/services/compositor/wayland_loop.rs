@@ -25,8 +25,7 @@ pub(super) fn reconnect_backoff(running: &AtomicBool, delay_ms: &mut u64) -> boo
         return false;
     }
     thread::sleep(Duration::from_millis(*delay_ms));
-    *delay_ms =
-        ((*delay_ms as f64) * RECONNECT_MULTIPLIER).min(RECONNECT_MAX_MS as f64) as u64;
+    *delay_ms = ((*delay_ms as f64) * RECONNECT_MULTIPLIER).min(RECONNECT_MAX_MS as f64) as u64;
     running.load(Ordering::SeqCst)
 }
 

@@ -708,18 +708,21 @@ impl NotificationService {
             return;
         }
 
-        let app_name =
-            truncate_text(params.child_value(0).str().unwrap_or("Unknown"), MAX_TEXT_CHARS);
+        let app_name = truncate_text(
+            params.child_value(0).str().unwrap_or("Unknown"),
+            MAX_TEXT_CHARS,
+        );
         let replaces_id = params.child_value(1).get::<u32>().unwrap_or(0);
-        let app_icon =
-            truncate_text(params.child_value(2).str().unwrap_or(""), MAX_TEXT_CHARS);
+        let app_icon = truncate_text(params.child_value(2).str().unwrap_or(""), MAX_TEXT_CHARS);
         let summary = truncate_text(params.child_value(3).str().unwrap_or(""), MAX_TEXT_CHARS);
         let body = truncate_text(params.child_value(4).str().unwrap_or(""), MAX_TEXT_CHARS);
 
         // Parse actions array
         let actions_variant = params.child_value(5);
         let mut actions: Vec<(String, String)> = Vec::new();
-        let n_actions = actions_variant.n_children().min(MAX_ACTIONS.saturating_mul(2));
+        let n_actions = actions_variant
+            .n_children()
+            .min(MAX_ACTIONS.saturating_mul(2));
         let mut i = 0;
         while i + 1 < n_actions {
             let action_id = truncate_text(
@@ -1274,10 +1277,9 @@ mod tests {
         let svc = make_service();
         // 100 history entries, all newer than the transients below.
         for i in 0..MAX_NOTIFICATIONS as u32 {
-            svc.notifications.borrow_mut().insert(
-                i + 1,
-                make_notification(i + 1, false, 1000.0 + i as f64),
-            );
+            svc.notifications
+                .borrow_mut()
+                .insert(i + 1, make_notification(i + 1, false, 1000.0 + i as f64));
         }
         // 5 transients older than any history: if transients were ignored they
         // would survive and the map would stay over the cap.

@@ -885,7 +885,10 @@ mod tests {
     #[test]
     fn malformed_image_data_is_rejected() {
         // Well-formed 2x2 RGBA: 8 bytes per row, 16 total.
-        assert_eq!(validated_image_layout(&image(2, 2, 8, 16)).map(|(rs, _)| rs), Some(8));
+        assert_eq!(
+            validated_image_layout(&image(2, 2, 8, 16)).map(|(rs, _)| rs),
+            Some(8)
+        );
 
         // Negative / zero rowstride used to cast to usize::MAX and crash GTK.
         assert!(validated_image_layout(&image(2, 2, -1, 16)).is_none());

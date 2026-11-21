@@ -241,7 +241,10 @@ impl IpcListener {
                 .and_then(|probe| probe.connect(&path))
                 .is_ok()
         {
-            warn!("IPC: socket at {:?} is already served by another instance", path);
+            warn!(
+                "IPC: socket at {:?} is already served by another instance",
+                path
+            );
             return None;
         }
         if path.exists() {
