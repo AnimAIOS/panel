@@ -296,11 +296,17 @@ impl Model {
     }
 }
 
-/// State shared between the client thread and request callers.
-struct ClientShared {
+/// The live connection and queue handle, replaced on every reconnect so
+/// requests from other threads go to the current compositor.
+struct Live {
     connection: Connection,
     /// To schedule a publish from another thread; see `enable_list`.
     qh: QueueHandle<ClientState>,
+}
+
+/// State shared between the client thread and request callers.
+struct ClientShared {
+    live: Mutex<Option<Live>>,
     seat: Mutex<Option<wl_seat::WlSeat>>,
     /// Window list ID -> handle.
     handles: Mutex<HashMap<u64, ZwlrForeignToplevelHandleV1>>,
@@ -556,6 +562,92 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for ClientState {
     }
 }
 
+/// Fresh connection, queue and state for one (re)connect. Updates `shared`
+/// only on success, so request callers never use a half-initialised connection.
+fn connect(
+    shared: &Arc<ClientShared>,
+    on_update: Option<WindowCallback>,
+) -> Option<(EventQueue<ClientState>, ClientState)> {
+    let connection = Connection::connect_to_env()
+        .map_err(|e| debug!("foreign-toplevel: no Wayland connection: {e}"))
+        .ok()?;
+    let mut queue: EventQueue<ClientState> = connection.new_event_queue();
+    let qh = queue.handle();
+    let registry = connection.display().get_registry(&qh, ());
+
+    let mut state = ClientState {
+        manager: None,
+        manager_global: None,
+        defer_manager: true,
+        output_globals: HashMap::new(),
+        seat_global: None,
+        model: Model::default(),
+        ready: false,
+        sync_pending: false,
+        on_update,
+        shared: shared.clone(),
+    };
+
+    let roundtrip = |queue: &mut EventQueue<ClientState>, state: &mut ClientState| {
+        queue
+            .roundtrip(state)
+            .map_err(|e| warn!("foreign-toplevel roundtrip failed: {e}"))
+            .ok()
+    };
+    // Globals first. The manager is bound after the outputs, because
+    // `output_enter` is only sent for outputs the client has bound.
+    roundtrip(&mut queue, &mut state)?;
+    state.defer_manager = false;
+    if let Some((name, version)) = state.manager_global.take() {
+        state.manager = Some(registry.bind(name, version, &qh, ()));
+    }
+    // Output names and the initial toplevel burst.
+    roundtrip(&mut queue, &mut state)?;
+    if state.manager.is_none() {
+        debug!("Compositor does not advertise {MANAGER_INTERFACE}");
+        return None;
+    }
+    state.ready = true;
+    state.publish();
+
+    *shared.live.lock() = Some(Live {
+        connection: connection.clone(),
+        qh,
+    });
+    Some((queue, state))
+}
+
+/// Keep the client alive across compositor restarts: on a connection error,
+/// clear published state, back off and reconnect until `running` is cleared.
+fn event_loop(
+    mut queue: EventQueue<ClientState>,
+    mut state: ClientState,
+    shared: Arc<ClientShared>,
+    running: Arc<AtomicBool>,
+    on_update: Option<WindowCallback>,
+) {
+    let mut backoff_ms = wayland_loop::RECONNECT_INITIAL_MS;
+    loop {
+        let clean_stop = wayland_loop::run(&mut queue, &mut state, &running, "foreign-toplevel");
+        if !clean_stop {
+            state.reset();
+        }
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        if !wayland_loop::reconnect_backoff(&running, &mut backoff_ms) {
+            break;
+        }
+        if let Some((next_queue, next_state)) = connect(&shared, on_update.clone()) {
+            queue = next_queue;
+            state = next_state;
+            backoff_ms = wayland_loop::RECONNECT_INITIAL_MS;
+        }
+        // connect failed: keep the current (larger) backoff and try again.
+    }
+    debug!("foreign-toplevel client stopped");
+}
+
 /// Runs on its own Wayland connection and thread.
 pub struct ForeignToplevelClient {
     running: Arc<AtomicBool>,
@@ -573,65 +665,20 @@ impl ForeignToplevelClient {
         on_update: Option<WindowCallback>,
         on_list: Option<WindowListCallback>,
     ) -> Option<Self> {
-        let connection = Connection::connect_to_env()
-            .map_err(|e| debug!("foreign-toplevel: no Wayland connection: {e}"))
-            .ok()?;
-        let mut queue: EventQueue<ClientState> = connection.new_event_queue();
-        let qh = queue.handle();
-        let registry = connection.display().get_registry(&qh, ());
-
         let shared = Arc::new(ClientShared {
-            connection: connection.clone(),
-            qh: qh.clone(),
+            live: Mutex::new(None),
             seat: Mutex::new(None),
             handles: Mutex::new(HashMap::new()),
             on_list: Mutex::new(on_list),
         });
-        let mut state = ClientState {
-            manager: None,
-            manager_global: None,
-            defer_manager: true,
-            output_globals: HashMap::new(),
-            seat_global: None,
-            model: Model::default(),
-            ready: false,
-            sync_pending: false,
-            on_update,
-            shared: shared.clone(),
-        };
-
-        let roundtrip = |queue: &mut EventQueue<ClientState>, state: &mut ClientState| {
-            queue
-                .roundtrip(state)
-                .map_err(|e| warn!("foreign-toplevel roundtrip failed: {e}"))
-                .ok()
-        };
-        // Globals first. The manager is bound after the outputs, because
-        // `output_enter` is only sent for outputs the client has bound.
-        roundtrip(&mut queue, &mut state)?;
-        state.defer_manager = false;
-        if let Some((name, version)) = state.manager_global.take() {
-            state.manager = Some(registry.bind(name, version, &qh, ()));
-        }
-        // Output names and the initial toplevel burst.
-        roundtrip(&mut queue, &mut state)?;
-        if state.manager.is_none() {
-            debug!("Compositor does not advertise {MANAGER_INTERFACE}");
-            return None;
-        }
-        state.ready = true;
-        state.publish();
+        let (queue, state) = connect(&shared, on_update.clone())?;
 
         let running = Arc::new(AtomicBool::new(true));
         let thread_running = running.clone();
+        let thread_shared = shared.clone();
         let thread = thread::Builder::new()
             .name("foreign-toplevel".into())
-            .spawn(move || {
-                if !wayland_loop::run(&mut queue, &mut state, &thread_running, "foreign-toplevel") {
-                    state.reset();
-                }
-                debug!("foreign-toplevel client stopped");
-            })
+            .spawn(move || event_loop(queue, state, thread_shared, thread_running, on_update))
             .map_err(|e| warn!("foreign-toplevel: failed to spawn thread: {e}"))
             .ok()?;
 
@@ -647,7 +694,9 @@ impl ForeignToplevelClient {
     pub fn enable_list(&self, on_list: WindowListCallback) {
         *self.shared.on_list.lock() = Some(on_list);
         // The sync's callback publishes on the client thread.
-        self.shared.connection.display().sync(&self.shared.qh, ());
+        if let Some(live) = self.shared.live.lock().as_ref() {
+            live.connection.display().sync(&live.qh, ());
+        }
         self.flush();
     }
 
@@ -660,7 +709,9 @@ impl ForeignToplevelClient {
     }
 
     fn flush(&self) {
-        if let Err(e) = self.shared.connection.flush() {
+        if let Some(live) = self.shared.live.lock().as_ref()
+            && let Err(e) = live.connection.flush()
+        {
             warn!("foreign-toplevel: flush failed: {e}");
         }
     }

@@ -18,9 +18,10 @@
 
 use std::cell::RefCell;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use tracing::{debug, warn};
 
@@ -197,6 +198,15 @@ pub fn notify_volume_unavailable() {
     }
 }
 
+/// True when `path` still refers to the socket file this listener bound. A
+/// second instance that unlinks and rebinds the path changes its inode, so the
+/// old listener must not delete it on drop.
+fn socket_is_ours(path: &Path, bound_inode: u64) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.ino() == bound_inode)
+        .unwrap_or(false)
+}
+
 use gtk4::glib;
 
 /// Listener for panel IPC messages.
@@ -208,6 +218,8 @@ pub struct IpcListener {
     _socket: UnixDatagram,
     /// Path to the socket file (for cleanup on drop).
     socket_path: PathBuf,
+    /// Inode of the socket file we bound; reused to verify ownership on drop.
+    socket_inode: u64,
     /// GLib source ID for the fd watcher.
     source_id: Option<glib::SourceId>,
     /// Registered callback for incoming messages.
@@ -222,7 +234,16 @@ impl IpcListener {
     pub fn new() -> Option<Rc<RefCell<Self>>> {
         let path = socket_path();
 
-        // Remove stale socket if it exists.
+        // Never steal a socket owned by a live instance: a datagram connect to
+        // a stale path fails, while one with a listener behind it succeeds.
+        if path.exists()
+            && UnixDatagram::unbound()
+                .and_then(|probe| probe.connect(&path))
+                .is_ok()
+        {
+            warn!("IPC: socket at {:?} is already served by another instance", path);
+            return None;
+        }
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
@@ -232,6 +253,17 @@ impl IpcListener {
             Ok(s) => s,
             Err(e) => {
                 warn!("IPC: failed to bind socket at {:?}: {}", path, e);
+                return None;
+            }
+        };
+
+        // Remember which socket file we own so Drop can leave a replacement
+        // from another instance alone.
+        let socket_inode = match std::fs::metadata(&path) {
+            Ok(meta) => meta.ino(),
+            Err(e) => {
+                warn!("IPC: failed to stat socket at {:?}: {}", path, e);
+                let _ = std::fs::remove_file(&path);
                 return None;
             }
         };
@@ -252,6 +284,7 @@ impl IpcListener {
         let listener = Rc::new(RefCell::new(Self {
             _socket: socket,
             socket_path: path,
+            socket_inode,
             source_id: None,
             callback,
         }));
@@ -325,8 +358,11 @@ impl Drop for IpcListener {
             source_id.remove();
         }
 
-        // Clean up the socket file.
-        let _ = std::fs::remove_file(&self.socket_path);
+        // Clean up only the socket file we bound. If another instance has
+        // replaced the path, unlinking it would leave that instance unreachable.
+        if socket_is_ours(&self.socket_path, self.socket_inode) {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
 
         debug!("IPC: listener stopped");
     }
@@ -335,6 +371,26 @@ impl Drop for IpcListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_check_tracks_replaced_socket() {
+        let dir = crate::ui_regression_test_support::TestDir::new("ipc-ownership");
+        let path = dir.path().join("vibepanel.sock");
+
+        std::fs::write(&path, b"first").unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert!(socket_is_ours(&path, inode));
+
+        // A second instance unlinks and recreates the path with a new inode.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"second").unwrap();
+        assert!(!socket_is_ours(&path, inode));
+        let new_inode = std::fs::metadata(&path).unwrap().ino();
+        assert!(socket_is_ours(&path, new_inode));
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(!socket_is_ours(&path, new_inode));
+    }
 
     #[test]
     fn roundtrip_cases() {

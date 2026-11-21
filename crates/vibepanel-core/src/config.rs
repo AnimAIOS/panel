@@ -218,7 +218,7 @@ impl Config {
     ///
     /// This parses both the default config and user config as TOML tables,
     /// deep-merges them (user values win), then deserializes the result.
-    fn load_with_defaults(user_toml: &str) -> Result<Self> {
+    pub fn load_with_defaults(user_toml: &str) -> Result<Self> {
         // This should never fail since it's embedded and tested
         let mut base: Table = toml::from_str(DEFAULT_CONFIG_TOML)
             .expect("embedded DEFAULT_CONFIG_TOML should always be valid");
@@ -432,8 +432,10 @@ impl Config {
                 );
 
             let low_threshold = low_threshold.unwrap_or(DEFAULT_BATTERY_LOW_THRESHOLD);
+            // An explicit low below the default critical must not be rejected for a
+            // critical value the user never set.
             let critical_threshold =
-                critical_threshold.unwrap_or(DEFAULT_BATTERY_CRITICAL_THRESHOLD);
+                critical_threshold.unwrap_or(DEFAULT_BATTERY_CRITICAL_THRESHOLD.min(low_threshold));
 
             if low_threshold == 0 || low_threshold > 100 {
                 errors.push("widgets.battery.low_threshold: must be between 1 and 100".to_string());
@@ -1279,7 +1281,7 @@ impl Config {
             .options
             .get("critical_threshold")
             .and_then(|value| widget_option_u32(value).ok())
-            .unwrap_or(DEFAULT_BATTERY_CRITICAL_THRESHOLD);
+            .unwrap_or(DEFAULT_BATTERY_CRITICAL_THRESHOLD.min(low_threshold));
 
         BatteryAlertConfig {
             enabled: self.widgets.is_active("battery") && alerts,
@@ -1848,6 +1850,26 @@ mod tests {
                 "{invalid} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn battery_low_threshold_without_critical_is_valid() {
+        let config = Config::load_with_defaults(
+            "[widgets]\nright = [\"battery\"]\n\n[widgets.battery]\nlow_threshold = 3\n",
+        )
+        .unwrap();
+        assert!(
+            config.validate().is_ok(),
+            "low_threshold=3 with critical unset should validate: {:?}",
+            config.validate().err()
+        );
+
+        // Both explicit and inverted is still rejected.
+        let inverted = Config::load_with_defaults(
+            "[widgets]\nright = [\"battery\"]\n\n[widgets.battery]\nlow_threshold = 10\ncritical_threshold = 15\n",
+        )
+        .unwrap();
+        assert!(inverted.validate().is_err());
     }
 
     #[test]

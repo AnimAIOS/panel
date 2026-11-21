@@ -77,6 +77,14 @@ const HYPRPAPER_STATUS_ACTIVE_WALLPAPER: u32 = 0;
 const HW_MAX_VARCHAR_LEN: usize = 64 * 1024;
 const HW_MAX_ARRAY_COUNT: usize = 4096;
 
+// A single status message never legitimately carries more than a handful of
+// args, and a snapshot never needs hundreds of messages. Together with the
+// total byte budget below, a peer that keeps streaming frames can't spin the
+// read loops forever or grow `pending` without bound.
+const HW_MAX_MESSAGE_ARGS: usize = 32;
+const HW_MAX_MESSAGES_PER_WAIT: usize = 256;
+const HW_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug)]
 enum HyprwireValue {
     Uint(u32),
@@ -96,6 +104,7 @@ struct HyprwireMessage {
 struct HyprwireClient {
     stream: UnixStream,
     next_seq: u32,
+    bytes_read: u64,
 }
 
 impl HyprwireClient {
@@ -110,6 +119,7 @@ impl HyprwireClient {
         Ok(Self {
             stream,
             next_seq: 0,
+            bytes_read: 0,
         })
     }
 
@@ -198,7 +208,12 @@ impl HyprwireClient {
     /// Unrelated messages are discarded. A fatal protocol error terminates
     /// the wait with the server-provided description.
     fn await_new_object(&mut self, expected_seq: u32) -> Result<u32, String> {
+        let mut message_count = 0;
         loop {
+            if message_count >= HW_MAX_MESSAGES_PER_WAIT {
+                return Err("too many hyprwire messages while waiting for new-object".to_string());
+            }
+            message_count += 1;
             let msg = self.read_message()?;
             match msg.code {
                 HW_NEW_OBJECT => {
@@ -236,15 +251,18 @@ impl HyprwireClient {
 
     fn read_message(&mut self) -> Result<HyprwireMessage, String> {
         let mut code = [0u8; 1];
-        self.stream
-            .read_exact(&mut code)
-            .map_err(|e| e.to_string())?;
+        self.read_bytes(&mut code)?;
 
         let mut args = Vec::new();
         loop {
             let magic = self.read_byte()?;
             if magic == HW_END {
                 break;
+            }
+            if args.len() >= HW_MAX_MESSAGE_ARGS {
+                return Err(format!(
+                    "hyprwire message exceeds {HW_MAX_MESSAGE_ARGS} args"
+                ));
             }
             args.push(self.read_value(magic)?);
         }
@@ -268,9 +286,7 @@ impl HyprwireClient {
                     ));
                 }
                 let mut data = vec![0u8; len];
-                self.stream
-                    .read_exact(&mut data)
-                    .map_err(|e| e.to_string())?;
+                self.read_bytes(&mut data)?;
                 let text = String::from_utf8(data).map_err(|e| e.to_string())?;
                 Ok(HyprwireValue::Varchar(text))
             }
@@ -306,9 +322,7 @@ impl HyprwireClient {
                         ));
                     }
                     let mut data = vec![0u8; len];
-                    self.stream
-                        .read_exact(&mut data)
-                        .map_err(|e| e.to_string())?;
+                    self.read_bytes(&mut data)?;
                     items.push(String::from_utf8(data).map_err(|e| e.to_string())?);
                 }
                 Ok(HyprwireValue::ArrayVarchar(items))
@@ -320,19 +334,28 @@ impl HyprwireClient {
         }
     }
 
+    /// Read exactly `buf.len()` bytes, enforcing the total session budget.
+    fn read_bytes(&mut self, buf: &mut [u8]) -> Result<(), String> {
+        let added = buf.len() as u64;
+        if self.bytes_read.saturating_add(added) > HW_MAX_TOTAL_BYTES {
+            return Err(format!(
+                "hyprwire read budget {HW_MAX_TOTAL_BYTES} bytes exceeded"
+            ));
+        }
+        self.stream.read_exact(buf).map_err(|e| e.to_string())?;
+        self.bytes_read += added;
+        Ok(())
+    }
+
     fn read_byte(&mut self) -> Result<u8, String> {
         let mut byte = [0u8; 1];
-        self.stream
-            .read_exact(&mut byte)
-            .map_err(|e| e.to_string())?;
+        self.read_bytes(&mut byte)?;
         Ok(byte[0])
     }
 
     fn read_u32(&mut self) -> Result<u32, String> {
         let mut bytes = [0u8; 4];
-        self.stream
-            .read_exact(&mut bytes)
-            .map_err(|e| e.to_string())?;
+        self.read_bytes(&mut bytes)?;
         Ok(u32::from_le_bytes(bytes))
     }
 
@@ -715,6 +738,10 @@ fn detect_hyprpaper_hyprwire(stream: UnixStream, monitor: Option<&str>) -> Optio
 
         match msg.code {
             HW_GENERIC_PROTOCOL_MESSAGE => {
+                // Cap pending messages: drop the oldest once over cap.
+                if pending.len() >= HW_MAX_MESSAGES_PER_WAIT {
+                    pending.remove(0);
+                }
                 pending.push(msg);
             }
             HW_ROUNDTRIP_DONE => {
@@ -911,6 +938,67 @@ pub fn theme_from_source_color(source: Argb) -> material_colors::theme::Theme {
     ThemeBuilder::with_source(source).build()
 }
 
+fn wallpaper_too_large(path: &str, len: u64, max_size: u64) -> bool {
+    if len > max_size {
+        warn!(
+            "Wallpaper '{}' too large ({} MB, max {} MB)",
+            path,
+            len / (1024 * 1024),
+            max_size / (1024 * 1024)
+        );
+        return true;
+    }
+    false
+}
+
+/// Read a wallpaper image, refusing non-regular files and capping the bytes read.
+///
+/// The size is checked both on the path and on the open descriptor, then the
+/// read is bounded to `max_size + 1` so a file that grows in between is caught
+/// by the final check instead of being read into memory in full.
+fn read_wallpaper_bytes(path: &str, max_size: u64) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path)
+        .inspect_err(|e| warn!("Failed to stat wallpaper '{}': {}", path, e))
+        .ok()?;
+    if !meta.is_file() {
+        warn!("Wallpaper '{}' is not a regular file", path);
+        return None;
+    }
+    if wallpaper_too_large(path, meta.len(), max_size) {
+        return None;
+    }
+
+    let file = std::fs::File::open(path)
+        .inspect_err(|e| warn!("Failed to open wallpaper '{}': {}", path, e))
+        .ok()?;
+    // Re-check on the descriptor: the path may have been swapped since the stat.
+    let meta = file
+        .metadata()
+        .inspect_err(|e| warn!("Failed to stat wallpaper '{}': {}", path, e))
+        .ok()?;
+    if !meta.is_file() {
+        warn!("Wallpaper '{}' is not a regular file", path);
+        return None;
+    }
+    if wallpaper_too_large(path, meta.len(), max_size) {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    file.take(max_size + 1)
+        .read_to_end(&mut bytes)
+        .inspect_err(|e| warn!("Failed to read wallpaper image '{}': {}", path, e))
+        .ok()?;
+    if bytes.len() as u64 > max_size {
+        warn!(
+            "Wallpaper '{}' grew beyond the size limit while reading",
+            path
+        );
+        return None;
+    }
+    Some(bytes)
+}
+
 /// Extract a Material You theme and average relative luminance from a wallpaper image.
 ///
 /// Returns `(Theme, luminance)` where:
@@ -925,23 +1013,7 @@ pub fn theme_from_source_color(source: Argb) -> material_colors::theme::Theme {
 pub fn extract_theme_from_image(
     path: &str,
 ) -> Option<(Option<material_colors::theme::Theme>, f64)> {
-    let file_size = std::fs::metadata(path)
-        .inspect_err(|e| warn!("Failed to stat wallpaper '{}': {}", path, e))
-        .ok()?
-        .len();
-    if file_size > MAX_WALLPAPER_FILE_SIZE {
-        warn!(
-            "Wallpaper '{}' too large ({} MB, max {} MB)",
-            path,
-            file_size / (1024 * 1024),
-            MAX_WALLPAPER_FILE_SIZE / (1024 * 1024)
-        );
-        return None;
-    }
-
-    let image_bytes = std::fs::read(path)
-        .inspect_err(|e| warn!("Failed to read wallpaper image '{}': {}", path, e))
-        .ok()?;
+    let image_bytes = read_wallpaper_bytes(path, MAX_WALLPAPER_FILE_SIZE)?;
 
     let img = image::load_from_memory(&image_bytes)
         .inspect_err(|e| warn!("Failed to decode wallpaper image '{}': {}", path, e))
@@ -986,6 +1058,48 @@ pub fn extract_theme_from_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_temp_dir() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("vp-wallpaper-test-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reads_regular_file_within_size_limit() {
+        let dir = unique_temp_dir();
+        let path = dir.join("wall.png");
+        std::fs::write(&path, b"image-bytes").unwrap();
+
+        let bytes = read_wallpaper_bytes(path.to_str().unwrap(), 100);
+        assert_eq!(bytes.as_deref(), Some(&b"image-bytes"[..]));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_regular_path() {
+        let dir = unique_temp_dir();
+        // A directory is not a regular file: the old stat-then-read path would
+        // happily try to fs::read it. FIFOs are rejected by the same check.
+        assert_eq!(read_wallpaper_bytes(dir.to_str().unwrap(), 100), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_file_larger_than_limit() {
+        let dir = unique_temp_dir();
+        let path = dir.join("big.png");
+        std::fs::write(&path, b"1234567890").unwrap();
+
+        assert_eq!(read_wallpaper_bytes(path.to_str().unwrap(), 5), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Regression (09a36d7): a greyscale image has no high-chroma colours, which
     /// used to make extraction return `None` and discard the computed luminance.
@@ -1395,6 +1509,48 @@ mod tests {
         buf.extend_from_slice(args);
         buf.push(HW_END);
         stream.write_all(&buf).expect("write mock message");
+    }
+
+    #[test]
+    fn rejects_message_with_too_many_args() {
+        let (mut tx, rx) = UnixStream::pair().expect("socket pair");
+        let mut client = HyprwireClient::from_stream(rx).unwrap();
+
+        let mut args = Vec::new();
+        for _ in 0..=HW_MAX_MESSAGE_ARGS {
+            args.extend_from_slice(&enc(&HyprwireValue::Uint(1)));
+        }
+        mock_send(&mut tx, 0x42, &args);
+
+        assert!(client.read_message().is_err());
+    }
+
+    #[test]
+    fn counts_bytes_toward_read_budget() {
+        let (mut tx, rx) = UnixStream::pair().expect("socket pair");
+        let mut client = HyprwireClient::from_stream(rx).unwrap();
+
+        mock_send(&mut tx, 0x42, &enc(&HyprwireValue::Uint(7)));
+        let msg = client.read_message().unwrap();
+        assert_eq!(msg.args.len(), 1);
+        // code + magic + u32 + END = 7 bytes.
+        assert_eq!(client.bytes_read, 7);
+
+        client.bytes_read = HW_MAX_TOTAL_BYTES;
+        mock_send(&mut tx, 0x42, &[]);
+        assert!(client.read_message().is_err());
+    }
+
+    #[test]
+    fn await_new_object_bounds_unrelated_messages() {
+        let (mut tx, rx) = UnixStream::pair().expect("socket pair");
+        let mut client = HyprwireClient::from_stream(rx).unwrap();
+
+        for _ in 0..=HW_MAX_MESSAGES_PER_WAIT {
+            mock_send(&mut tx, 0x42, &[]);
+        }
+        let err = client.await_new_object(1).unwrap_err();
+        assert!(err.contains("too many"), "unexpected error: {err}");
     }
 
     /// Exercises the local hyprwire state machine end-to-end. This guards

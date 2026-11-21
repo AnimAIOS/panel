@@ -3,6 +3,8 @@
 
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use tracing::warn;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
@@ -10,6 +12,23 @@ use wayland_client::protocol::wl_registry;
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 
 const POLL_TIMEOUT_MS: i32 = 500;
+
+/// Reconnect backoff, mirroring the IPC backends (`niri.rs`, `sway.rs`).
+pub(super) const RECONNECT_INITIAL_MS: u64 = 1000;
+pub(super) const RECONNECT_MAX_MS: u64 = 30000;
+const RECONNECT_MULTIPLIER: f64 = 1.5;
+
+/// Sleep for the current delay and grow it, or stop if `running` was cleared.
+/// Returns whether the caller should attempt a reconnect.
+pub(super) fn reconnect_backoff(running: &AtomicBool, delay_ms: &mut u64) -> bool {
+    if !running.load(Ordering::SeqCst) {
+        return false;
+    }
+    thread::sleep(Duration::from_millis(*delay_ms));
+    *delay_ms =
+        ((*delay_ms as f64) * RECONNECT_MULTIPLIER).min(RECONNECT_MAX_MS as f64) as u64;
+    running.load(Ordering::SeqCst)
+}
 
 /// Dispatch `queue` until `running` is cleared or the connection fails.
 ///
@@ -81,5 +100,23 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ProbeState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_and_respects_stop() {
+        let running = AtomicBool::new(true);
+        let mut delay = 2;
+        assert!(reconnect_backoff(&running, &mut delay));
+        assert_eq!(delay, 3);
+
+        running.store(false, Ordering::SeqCst);
+        assert!(!reconnect_backoff(&running, &mut delay));
+        // A cleared flag must not sleep or grow the delay.
+        assert_eq!(delay, 3);
     }
 }

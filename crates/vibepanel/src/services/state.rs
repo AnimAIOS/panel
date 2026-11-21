@@ -8,7 +8,7 @@
 //! - Media window open state
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Maximum number of notifications to persist to disk
 const MAX_PERSISTED_NOTIFICATIONS: usize = 50;
@@ -152,7 +152,7 @@ pub fn save(state: &PersistedState) {
 
     match serde_json::to_string_pretty(&state) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = write_state_atomic(&path, &json) {
                 tracing::warn!("Failed to save state to {:?}: {}", path, e);
             } else {
                 tracing::debug!("Saved state to {:?}", path);
@@ -164,9 +164,49 @@ pub fn save(state: &PersistedState) {
     }
 }
 
+/// Write state to a sibling temp file, then rename it over the real path.
+///
+/// A crash mid-write leaves the previous `state.json` intact instead of a
+/// truncated one that `load()` would silently replace with defaults.
+fn write_state_atomic(path: &Path, json: &str) -> std::io::Result<()> {
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_state_path() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vp-state-test-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_state_and_removes_temp() {
+        let dir = unique_state_path();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, r#"{"vpn":{}}"#).unwrap();
+
+        let state = PersistedState {
+            vpn: VpnState {
+                last_used_uuid: Some("abc-123".to_string()),
+            },
+            ..Default::default()
+        };
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        write_state_atomic(&path, &json).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), json);
+        assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn missing_notification_seen_ids_defaults_to_empty() {

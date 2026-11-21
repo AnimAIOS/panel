@@ -245,6 +245,12 @@ fn main() -> ExitCode {
         return handle_command(command, args.config.as_deref());
     }
 
+    // --print-example-config is self-help: it must work even when the config is broken.
+    if args.print_example_config {
+        print!("{}", vibepanel_core::config::DEFAULT_CONFIG_TOML);
+        return ExitCode::SUCCESS;
+    }
+
     if let Err(e) = i18n::init() {
         warn!("Failed to set up translations, using English: {e}");
     }
@@ -282,12 +288,9 @@ fn main() -> ExitCode {
         } else {
             println!("Configuration valid (using defaults)");
         }
-        return ExitCode::SUCCESS;
-    }
-
-    // --print-example-config: print the example config with comments
-    if args.print_example_config {
-        print!("{}", vibepanel_core::config::DEFAULT_CONFIG_TOML);
+        for warning in config.warnings() {
+            println!("Warning: {warning}");
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -319,6 +322,11 @@ fn handle_command(command: Command, config_path: Option<&Path>) -> ExitCode {
     }
 }
 
+/// Target percentage for a brightness increment; never wraps or exceeds 100.
+fn brightness_inc_target(current: u32, amount: u32) -> u32 {
+    current.saturating_add(amount).min(100)
+}
+
 /// Handle brightness subcommands using direct sysfs/logind access.
 fn handle_brightness_command(action: BrightnessAction) -> ExitCode {
     use crate::services::brightness::BrightnessCli;
@@ -348,7 +356,7 @@ fn handle_brightness_command(action: BrightnessAction) -> ExitCode {
         }
         BrightnessAction::Inc { amount } => {
             let current = cli.get_percent();
-            let new_value = (current + amount).min(100);
+            let new_value = brightness_inc_target(current, amount);
             if let Err(e) = cli.set_percent(new_value) {
                 eprintln!("Error: {}", e);
                 ExitCode::FAILURE
@@ -926,5 +934,13 @@ mod cli_tests {
                 action: NotificationsAction::Unread
             })
         ));
+    }
+
+    #[test]
+    fn brightness_inc_saturates_and_clamps() {
+        assert_eq!(brightness_inc_target(50, 5), 55);
+        assert_eq!(brightness_inc_target(90, 20), 100);
+        assert_eq!(brightness_inc_target(50, u32::MAX), 100);
+        assert_eq!(brightness_inc_target(u32::MAX, u32::MAX), 100);
     }
 }

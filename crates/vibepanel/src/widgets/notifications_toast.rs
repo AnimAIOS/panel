@@ -684,6 +684,18 @@ impl Drop for NotificationToast {
     }
 }
 
+/// Upper bound on simultaneously shown toast windows. Without it, a flood of
+/// never-expiring (critical / `expire_timeout=0`) toasts fills the screen and
+/// grows memory without limit.
+const MAX_TOASTS: usize = 20;
+
+/// Pick the oldest toast IDs to evict before adding one more, keeping the list
+/// (including the new toast) at or below MAX_TOASTS. `order` is oldest-first.
+fn toast_ids_to_evict(order: &[u32], count: usize) -> Vec<u32> {
+    let overflow = count.saturating_sub(MAX_TOASTS.saturating_sub(1));
+    order.iter().take(overflow).copied().collect()
+}
+
 /// Manages notification toast windows with vertical stacking.
 pub(super) struct NotificationToastManager {
     toasts: RefCell<HashMap<u32, Rc<NotificationToast>>>,
@@ -720,6 +732,16 @@ impl NotificationToastManager {
             // a second toast for the same notification.
             toast.update(notification, Rc::clone(&self.on_action));
             return;
+        }
+
+        // Evict the oldest toasts before adding this one so a flood of
+        // never-expiring toasts cannot accumulate unbounded windows.
+        let count = self.toasts.borrow().len();
+        let oldest = toast_ids_to_evict(&self.toast_order.borrow(), count);
+        for id in oldest {
+            // Closing routes through on_remove, which also drops the
+            // transient's service entry.
+            self.close_toast(id);
         }
 
         // Transient notifications are toast-only, so remove the service entry when the toast goes away.

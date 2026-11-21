@@ -13,10 +13,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Result as IoResult};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use tr::tr;
 
 use gtk4::glib::{self, SourceId};
@@ -30,6 +31,9 @@ const DEFAULT_CHECK_INTERVAL: u64 = 3600;
 
 /// Minimum check interval to prevent abuse (5 minutes).
 const MIN_CHECK_INTERVAL: u64 = 300;
+
+/// Maximum time any package-manager command may run before it is killed.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Supported package managers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +413,52 @@ pub(crate) fn has_flatpak() -> bool {
     Path::new("/usr/bin/flatpak").exists()
 }
 
+/// Like [`Command::output`], but kills the child if it runs past `timeout`.
+///
+/// Pipes are drained on separate threads so a chatty command can't block on a
+/// full pipe buffer and be killed for no reason. A timeout is reported as an
+/// `io::Error` of kind `TimedOut`, which the callers already turn into a normal
+/// `CheckResult` error (so `check_in_progress` is always reset).
+fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> IoResult<Output> {
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Output {
+                status,
+                stdout: stdout_reader.join().unwrap_or_default(),
+                stderr: stderr_reader.join().unwrap_or_default(),
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            // Killing the child closes its pipe write ends, so the readers finish.
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("command timed out after {}s", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Run the update check for the given package manager.
 ///
 /// This runs in a background thread and should not touch any GTK state.
@@ -445,7 +495,10 @@ fn run_update_check(pm: PackageManager, report_status: &dyn Fn(String)) -> Check
 fn check_dnf_updates(report_status: &dyn Fn(String)) -> CheckResult {
     // Phase 1: Refresh repo metadata (this is the slow, network-bound part)
     report_status(tr!("Refreshing dnf cache..."));
-    match dnf_command().args(["makecache", "--refresh"]).output() {
+    match output_with_timeout(
+        dnf_command().args(["makecache", "--refresh"]),
+        COMMAND_TIMEOUT,
+    ) {
         Ok(output) if !output.status.success() => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return CheckResult {
@@ -464,7 +517,10 @@ fn check_dnf_updates(report_status: &dyn Fn(String)) -> CheckResult {
 
     // Phase 2: Check for available upgrades against fresh cache
     report_status(tr!("Checking for upgrades..."));
-    let output = dnf_command().args(["upgrade", "--assumeno"]).output();
+    let output = output_with_timeout(
+        dnf_command().args(["upgrade", "--assumeno"]),
+        COMMAND_TIMEOUT,
+    );
 
     match output {
         Ok(output) => {
@@ -559,13 +615,13 @@ fn check_pacman_updates(report_status: &dyn Fn(String)) -> CheckResult {
     report_status(tr!("Checking {source}...", source = "pacman"));
 
     // Try checkupdates first (from pacman-contrib), fall back to pacman -Qu
-    let output = Command::new("checkupdates").output();
+    let output = output_with_timeout(&mut Command::new("checkupdates"), COMMAND_TIMEOUT);
 
     let output = match output {
         Ok(o) if o.status.success() || o.status.code() == Some(2) => o,
         _ => {
             // Fallback to pacman -Qu
-            match Command::new("pacman").args(["-Qu"]).output() {
+            match output_with_timeout(Command::new("pacman").args(["-Qu"]), COMMAND_TIMEOUT) {
                 Ok(o) => o,
                 Err(e) => {
                     return CheckResult {
@@ -599,7 +655,7 @@ fn check_paru_updates(report_status: &dyn Fn(String)) -> CheckResult {
 
     // Check official repos with checkupdates
     report_status(tr!("Checking official repos..."));
-    let official_output = Command::new("checkupdates").output();
+    let official_output = output_with_timeout(&mut Command::new("checkupdates"), COMMAND_TIMEOUT);
 
     match official_output {
         Ok(output) if output.status.success() || output.status.code() == Some(2) => {
@@ -615,7 +671,9 @@ fn check_paru_updates(report_status: &dyn Fn(String)) -> CheckResult {
                 "checkupdates failed with code {:?}, trying pacman -Qu",
                 output.status.code()
             );
-            if let Ok(fallback) = Command::new("pacman").args(["-Qu"]).output() {
+            if let Ok(fallback) =
+                output_with_timeout(Command::new("pacman").args(["-Qu"]), COMMAND_TIMEOUT)
+            {
                 let stdout = String::from_utf8_lossy(&fallback.stdout);
                 let updates = parse_checkupdates_output(&stdout);
                 if !updates.is_empty() {
@@ -626,7 +684,9 @@ fn check_paru_updates(report_status: &dyn Fn(String)) -> CheckResult {
         Err(e) => {
             debug!("checkupdates not available: {}, trying pacman -Qu", e);
             // checkupdates not installed, try pacman -Qu
-            if let Ok(fallback) = Command::new("pacman").args(["-Qu"]).output() {
+            if let Ok(fallback) =
+                output_with_timeout(Command::new("pacman").args(["-Qu"]), COMMAND_TIMEOUT)
+            {
                 let stdout = String::from_utf8_lossy(&fallback.stdout);
                 let updates = parse_checkupdates_output(&stdout);
                 if !updates.is_empty() {
@@ -638,7 +698,7 @@ fn check_paru_updates(report_status: &dyn Fn(String)) -> CheckResult {
 
     // Check AUR with paru -Qua
     report_status(tr!("Checking {source}...", source = "AUR"));
-    let aur_output = Command::new("paru").args(["-Qua"]).output();
+    let aur_output = output_with_timeout(Command::new("paru").args(["-Qua"]), COMMAND_TIMEOUT);
 
     match aur_output {
         Ok(output) if output.status.success() => {
@@ -687,10 +747,11 @@ fn check_flatpak_updates(report_status: &dyn Fn(String)) -> CheckResult {
 
 /// Append Flatpak updates under the `flatpak` repo key.
 fn append_flatpak_updates(by_repo: &mut HashMap<String, Vec<UpdateInfo>>) -> Result<(), String> {
-    let output = Command::new("flatpak")
-        .args(["remote-ls", "--updates", "--columns=application"])
-        .output()
-        .map_err(|e| format!("Failed to run flatpak: {}", e))?;
+    let output = output_with_timeout(
+        Command::new("flatpak").args(["remote-ls", "--updates", "--columns=application"]),
+        COMMAND_TIMEOUT,
+    )
+    .map_err(|e| format!("Failed to run flatpak: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -847,6 +908,34 @@ mesa 23.2.1-1 -> 23.3.0-1 [ignoriert]
         assert_eq!(result[2].name, "firefox");
 
         assert!(parse_checkupdates_output("").is_empty());
+    }
+
+    /// A child-mode test: sleeps only when the env var is set, so the timeout
+    /// test can re-invoke this test binary without any external command.
+    #[test]
+    fn timeout_child() {
+        if std::env::var_os("VP_UPDATES_TIMEOUT_CHILD").is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn output_with_timeout_returns_before_deadline() {
+        let exe = std::env::current_exe().unwrap();
+        let output = output_with_timeout(Command::new(exe).arg("--list"), Duration::from_secs(10))
+            .expect("--list should finish well within the deadline");
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+    }
+
+    #[test]
+    fn output_with_timeout_kills_slow_command() {
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = Command::new(exe);
+        cmd.arg("timeout_child")
+            .env("VP_UPDATES_TIMEOUT_CHILD", "1");
+        let err = output_with_timeout(&mut cmd, Duration::from_millis(250)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]

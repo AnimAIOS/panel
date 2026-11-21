@@ -667,19 +667,24 @@ fn auto_location_cache_is_fresh(cached: &AutoLocationCache, now: SystemTime) -> 
 }
 
 fn ip_auto_locate() -> Result<WeatherLocation, String> {
-    // ip-api only supports HTTPS on its paid tier.
-    let response: AutoLocateResponse = parse_json(
-        &http_get("http://ip-api.com/json/?fields=status,message,lat,lon,city,country")?,
-        "auto-location",
-    )?;
-    if response.status.as_deref() != Some("success") {
+    // ipwho.is serves its free tier over HTTPS; minreq handles TLS here.
+    let body = http_get("https://ipwho.is/")?;
+    parse_auto_locate_response(&body)
+}
+
+/// Parse and validate an ipwho.is geolocation response.
+fn parse_auto_locate_response(body: &str) -> Result<WeatherLocation, String> {
+    let response: AutoLocateResponse = parse_json(body, "auto-location")?;
+    if !response.success.unwrap_or(false) {
         return Err(response
             .message
             .unwrap_or_else(|| "Auto-location failed".to_string()));
     }
 
-    let latitude = response.lat.ok_or("Auto-location missing latitude")?;
-    let longitude = response.lon.ok_or("Auto-location missing longitude")?;
+    let latitude = response.latitude.ok_or("Auto-location missing latitude")?;
+    let longitude = response
+        .longitude
+        .ok_or("Auto-location missing longitude")?;
     Ok(WeatherLocation {
         name: ip_location_label(response.city, response.country, latitude, longitude),
         latitude,
@@ -1159,10 +1164,10 @@ struct GeocodingResult {
 
 #[derive(Debug, Deserialize)]
 struct AutoLocateResponse {
-    status: Option<String>,
+    success: Option<bool>,
     message: Option<String>,
-    lat: Option<f64>,
-    lon: Option<f64>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
     city: Option<String>,
     country: Option<String>,
 }
@@ -1333,6 +1338,23 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn parses_ip_auto_locate_response() {
+        let body = r#"{"success":true,"latitude":57.7,"longitude":12.0,"city":"Mölndal","country":"Sweden"}"#;
+        let location = parse_auto_locate_response(body).unwrap();
+        assert_eq!(location.name, "Mölndal, Sweden");
+        assert_eq!(location.latitude, 57.7);
+        assert_eq!(location.longitude, 12.0);
+    }
+
+    #[test]
+    fn rejects_failed_or_incomplete_ip_auto_locate_responses() {
+        assert!(parse_auto_locate_response(r#"{"success":false,"message":"blocked"}"#).is_err());
+        assert!(parse_auto_locate_response(r#"{"success":true,"latitude":1.0}"#).is_err());
+        assert!(parse_auto_locate_response(r#"{"latitude":1.0,"longitude":2.0}"#).is_err());
+        assert!(parse_auto_locate_response("not json").is_err());
     }
 
     #[test]

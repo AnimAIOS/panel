@@ -92,6 +92,15 @@ const CAPABILITIES: &[&str] = &[
 /// When this limit is exceeded, the oldest notifications are removed.
 const MAX_NOTIFICATIONS: usize = 100;
 
+/// Max characters kept from untrusted text fields, and max action pairs, on ingest.
+const MAX_TEXT_CHARS: usize = 4096;
+const MAX_ACTIONS: usize = 32;
+
+/// Truncate to a character count without splitting a UTF-8 code point.
+fn truncate_text(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 /// Snapshot of a single notification.
 #[derive(Debug, Clone)]
 pub struct Notification {
@@ -132,21 +141,33 @@ pub struct NotificationImage {
 }
 
 impl Notification {
-    /// Convert to a persistable form (omits image_data which is binary)
+    /// Convert to a persistable form (omits image_data which is binary).
+    ///
+    /// save_state() is the only caller, so capping the hint strings here keeps
+    /// oversized values (e.g. restored from an old state file) off disk.
     pub fn to_persisted(&self) -> PersistedNotification {
         PersistedNotification {
             id: self.id,
             app_name: self.app_name.clone(),
-            app_icon: self.app_icon.clone(),
+            app_icon: truncate_text(&self.app_icon, MAX_TEXT_CHARS),
             summary: self.summary.clone(),
             body: self.body.clone(),
             actions: self.actions.clone(),
             urgency: self.urgency,
             timestamp: self.timestamp,
             expire_timeout: self.expire_timeout,
-            desktop_entry: self.desktop_entry.clone(),
-            origin_name: self.origin_name.clone(),
-            image_path: self.image_path.clone(),
+            desktop_entry: self
+                .desktop_entry
+                .as_deref()
+                .map(|v| truncate_text(v, MAX_TEXT_CHARS)),
+            origin_name: self
+                .origin_name
+                .as_deref()
+                .map(|v| truncate_text(v, MAX_TEXT_CHARS)),
+            image_path: self
+                .image_path
+                .as_deref()
+                .map(|v| truncate_text(v, MAX_TEXT_CHARS)),
         }
     }
 }
@@ -687,28 +708,28 @@ impl NotificationService {
             return;
         }
 
-        let app_name = params.child_value(0).str().unwrap_or("Unknown").to_string();
+        let app_name =
+            truncate_text(params.child_value(0).str().unwrap_or("Unknown"), MAX_TEXT_CHARS);
         let replaces_id = params.child_value(1).get::<u32>().unwrap_or(0);
-        let app_icon = params.child_value(2).str().unwrap_or("").to_string();
-        let summary = params.child_value(3).str().unwrap_or("").to_string();
-        let body = params.child_value(4).str().unwrap_or("").to_string();
+        let app_icon =
+            truncate_text(params.child_value(2).str().unwrap_or(""), MAX_TEXT_CHARS);
+        let summary = truncate_text(params.child_value(3).str().unwrap_or(""), MAX_TEXT_CHARS);
+        let body = truncate_text(params.child_value(4).str().unwrap_or(""), MAX_TEXT_CHARS);
 
         // Parse actions array
         let actions_variant = params.child_value(5);
         let mut actions: Vec<(String, String)> = Vec::new();
-        let n_actions = actions_variant.n_children();
+        let n_actions = actions_variant.n_children().min(MAX_ACTIONS.saturating_mul(2));
         let mut i = 0;
         while i + 1 < n_actions {
-            let action_id = actions_variant
-                .child_value(i)
-                .str()
-                .unwrap_or("")
-                .to_string();
-            let action_label = actions_variant
-                .child_value(i + 1)
-                .str()
-                .unwrap_or("")
-                .to_string();
+            let action_id = truncate_text(
+                actions_variant.child_value(i).str().unwrap_or(""),
+                MAX_TEXT_CHARS,
+            );
+            let action_label = truncate_text(
+                actions_variant.child_value(i + 1).str().unwrap_or(""),
+                MAX_TEXT_CHARS,
+            );
             actions.push((action_id, action_label));
             i += 2;
         }
@@ -747,7 +768,7 @@ impl NotificationService {
                     }
                     "desktop-entry" => {
                         if let Some(v) = actual_value.str() {
-                            let v = v.to_string();
+                            let v = truncate_text(v, MAX_TEXT_CHARS);
                             if !v.is_empty() {
                                 desktop_entry = Some(v);
                             }
@@ -757,13 +778,13 @@ impl NotificationService {
                         if let Some(v) = actual_value.str() {
                             let v = v.trim();
                             if !v.is_empty() {
-                                origin_name = Some(v.to_string());
+                                origin_name = Some(truncate_text(v, MAX_TEXT_CHARS));
                             }
                         }
                     }
                     "image-path" => {
                         if let Some(v) = actual_value.str() {
-                            let v = v.to_string();
+                            let v = truncate_text(v, MAX_TEXT_CHARS);
                             if !v.is_empty() {
                                 image_path = Some(v);
                             }
@@ -894,6 +915,14 @@ impl NotificationService {
     }
 
     fn handle_close_notification(&self, params: &Variant, invocation: gio::DBusMethodInvocation) {
+        if params.n_children() < 1 {
+            invocation.return_error(
+                gio::IOErrorEnum::InvalidArgument,
+                "CloseNotification requires 1 argument",
+            );
+            return;
+        }
+
         let id = params.child_value(0).get::<u32>().unwrap_or(0);
         debug!(
             "NotificationService: CloseNotification D-Bus method called for id={}",
@@ -930,24 +959,23 @@ impl NotificationService {
         self.notify_listeners();
     }
 
-    /// Trim oldest history once the cap is exceeded. Transients are owned by
-    /// the toast manager — they don't count toward the cap and aren't evicted.
+    /// Trim the oldest notifications once the cap is exceeded. Transients count
+    /// toward the cap too: a never-expiring transient must not let the map grow
+    /// without bound.
     fn enforce_notification_limit(&self) {
         let mut notifications = self.notifications.borrow_mut();
 
-        let history_count = notifications.values().filter(|n| !n.transient).count();
-        if history_count <= MAX_NOTIFICATIONS {
+        if notifications.len() <= MAX_NOTIFICATIONS {
             return;
         }
 
         let mut by_time: Vec<(u32, f64)> = notifications
             .iter()
-            .filter(|(_, n)| !n.transient)
             .map(|(id, n)| (*id, n.timestamp))
             .collect();
         by_time.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let to_remove = history_count - MAX_NOTIFICATIONS;
+        let to_remove = notifications.len() - MAX_NOTIFICATIONS;
         for (id, _) in by_time.into_iter().take(to_remove) {
             notifications.remove(&id);
             debug!(
@@ -1169,6 +1197,35 @@ mod tests {
     }
 
     #[test]
+    fn persisted_hint_strings_are_capped() {
+        let long = "x".repeat(MAX_TEXT_CHARS + 10);
+        let mut n = make_notification(1, false, 0.0);
+        n.app_icon = long.clone();
+        n.desktop_entry = Some(long.clone());
+        n.origin_name = Some(long.clone());
+        n.image_path = Some(long.clone());
+
+        let p = n.to_persisted();
+        let len = |v: Option<&str>| v.map(|v| v.chars().count());
+        assert_eq!(p.app_icon.chars().count(), MAX_TEXT_CHARS);
+        assert_eq!(len(p.desktop_entry.as_deref()), Some(MAX_TEXT_CHARS));
+        assert_eq!(len(p.origin_name.as_deref()), Some(MAX_TEXT_CHARS));
+        assert_eq!(len(p.image_path.as_deref()), Some(MAX_TEXT_CHARS));
+    }
+
+    #[test]
+    fn untrusted_text_is_truncated_on_char_boundaries() {
+        assert_eq!(truncate_text("hello", 3), "hel");
+        assert_eq!(truncate_text("héllo", 4), "héll");
+        assert_eq!(truncate_text("short", MAX_TEXT_CHARS), "short");
+        let long = "x".repeat(MAX_TEXT_CHARS + 10);
+        assert_eq!(
+            truncate_text(&long, MAX_TEXT_CHARS).chars().count(),
+            MAX_TEXT_CHARS
+        );
+    }
+
+    #[test]
     fn introspection_exposes_unread_query_and_activation_token() {
         let node_info = gio::DBusNodeInfo::for_xml(NOTIFICATIONS_XML).unwrap();
         let unread = node_info
@@ -1213,57 +1270,37 @@ mod tests {
     }
 
     #[test]
-    fn enforce_limit_evicts_oldest_history_and_ignores_transients() {
-        type Timestamp = fn(usize) -> f64;
-        let cases: [(&str, usize, u32, Timestamp); 2] = [
-            (
-                "history at cap plus newer transients",
-                MAX_NOTIFICATIONS,
-                50,
-                |i| (1000 + i) as f64,
-            ),
-            // Older than any history: they would be evicted first if transients counted.
-            (
-                "history over cap plus older transients",
-                MAX_NOTIFICATIONS + 2,
-                5,
-                |i| -100.0 - i as f64,
-            ),
-        ];
-
-        for (name, history, transients, transient_timestamp) in cases {
-            let svc = make_service();
-            for i in 0..history as u32 {
-                svc.notifications
-                    .borrow_mut()
-                    .insert(i + 1, make_notification(i + 1, false, i as f64));
-            }
-            let transient_ids: Vec<u32> = (0..transients).map(|i| 10_000 + i).collect();
-            for (i, &id) in transient_ids.iter().enumerate() {
-                svc.notifications
-                    .borrow_mut()
-                    .insert(id, make_notification(id, true, transient_timestamp(i)));
-            }
-
-            svc.enforce_notification_limit();
-
-            let map = svc.notifications.borrow();
-            let evicted = (history - MAX_NOTIFICATIONS) as u32;
-            assert_eq!(
-                map.len(),
-                MAX_NOTIFICATIONS + transients as usize,
-                "{name}: only history over the cap is evicted"
+    fn enforce_limit_evicts_oldest_including_transients() {
+        let svc = make_service();
+        // 100 history entries, all newer than the transients below.
+        for i in 0..MAX_NOTIFICATIONS as u32 {
+            svc.notifications.borrow_mut().insert(
+                i + 1,
+                make_notification(i + 1, false, 1000.0 + i as f64),
             );
-            for id in 1..=evicted {
-                assert!(!map.contains_key(&id), "{name}: history id={id} evicted");
-            }
-            assert!(
-                map.contains_key(&(evicted + 1)),
-                "{name}: oldest history within the cap survives"
-            );
-            for id in &transient_ids {
-                assert!(map.contains_key(id), "{name}: transient id={id} kept");
-            }
+        }
+        // 5 transients older than any history: if transients were ignored they
+        // would survive and the map would stay over the cap.
+        let transient_ids: Vec<u32> = (0..5).map(|i| 10_000 + i).collect();
+        for (i, &id) in transient_ids.iter().enumerate() {
+            svc.notifications
+                .borrow_mut()
+                .insert(id, make_notification(id, true, -100.0 - i as f64));
+        }
+
+        svc.enforce_notification_limit();
+
+        let map = svc.notifications.borrow();
+        assert_eq!(
+            map.len(),
+            MAX_NOTIFICATIONS,
+            "total map (history + transients) capped at MAX_NOTIFICATIONS"
+        );
+        for id in &transient_ids {
+            assert!(!map.contains_key(id), "old transient id={id} evicted");
+        }
+        for id in 1..=MAX_NOTIFICATIONS as u32 {
+            assert!(map.contains_key(&id), "history id={id} kept");
         }
     }
 

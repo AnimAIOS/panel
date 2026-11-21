@@ -108,12 +108,26 @@ pub struct NotificationBody {
     pub prewarm_controller: Option<EventControllerMotion>,
 }
 
+/// Only hand these schemes to xdg-open. Notification bodies are untrusted, so
+/// `file://` and custom handlers must not be reachable by clicking a link.
+fn is_allowed_link_uri(uri: &str) -> bool {
+    let Some(pos) = uri.find(':') else {
+        return false;
+    };
+    let scheme = &uri[..pos];
+    scheme.eq_ignore_ascii_case("http")
+        || scheme.eq_ignore_ascii_case("https")
+        || scheme.eq_ignore_ascii_case("mailto")
+}
+
 /// Open label links without GTK's default URI launcher, which can violate
 /// layer-shell focus constraints on Wayland.
 fn connect_notification_link(label: &Label, after_open: impl Fn() + 'static) {
     label.connect_activate_link(move |_, uri| {
-        let command = format!("xdg-open '{}'", uri.replace("'", "'\\''"));
-        let _ = gtk4::glib::spawn_command_line_async(&command);
+        if is_allowed_link_uri(uri) {
+            let command = format!("xdg-open '{}'", uri.replace("'", "'\\''"));
+            let _ = gtk4::glib::spawn_command_line_async(&command);
+        }
         after_open();
         gtk4::glib::Propagation::Stop
     });
@@ -715,35 +729,46 @@ pub fn create_notification_image_widget(notification: &Notification) -> Widget {
     )
 }
 
+/// Validate untrusted image-data and return its (rowstride, memory format).
+///
+/// Kept pure so validation can be tested without a display. Malformed data would
+/// otherwise make GTK return a null texture, which panics when used.
+fn validated_image_layout(img: &NotificationImage) -> Option<(usize, gtk4::gdk::MemoryFormat)> {
+    use gtk4::gdk;
+
+    if img.width <= 0 || img.height <= 0 || img.data.is_empty() || img.rowstride <= 0 {
+        return None;
+    }
+
+    // The freedesktop notification spec uses RGBA format (not ARGB like StatusNotifierItem).
+    let (format, bytes_per_pixel) = if img.has_alpha && img.channels == 4 {
+        (gdk::MemoryFormat::R8g8b8a8, 4usize)
+    } else {
+        // 3-channel RGB (rare, but handle it)
+        (gdk::MemoryFormat::R8g8b8, 3usize)
+    };
+
+    let rowstride = img.rowstride as usize;
+    let min_rowstride = (img.width as usize).checked_mul(bytes_per_pixel)?;
+    let needed = rowstride.checked_mul(img.height as usize)?;
+    if rowstride < min_rowstride || img.data.len() < needed {
+        return None;
+    }
+
+    Some((rowstride, format))
+}
+
 /// Convert raw NotificationImage data into a gdk Texture.
 fn notification_image_to_texture(img: &NotificationImage) -> Option<gtk4::gdk::Texture> {
     use gtk4::gdk;
     use gtk4::glib::Bytes;
     use gtk4::prelude::*;
 
-    if img.width <= 0 || img.height <= 0 || img.data.is_empty() {
-        return None;
-    }
+    let (rowstride, format) = validated_image_layout(img)?;
 
-    // The freedesktop notification spec uses RGBA format (not ARGB like StatusNotifierItem).
     // Pass the raw bytes directly without conversion.
     let bytes = Bytes::from(&img.data[..]);
-
-    let format = if img.has_alpha && img.channels == 4 {
-        gdk::MemoryFormat::R8g8b8a8
-    } else {
-        // 3-channel RGB (rare, but handle it)
-        gdk::MemoryFormat::R8g8b8
-    };
-
-    let texture = gdk::MemoryTexture::new(
-        img.width,
-        img.height,
-        format,
-        &bytes,
-        img.rowstride as usize,
-    );
-
+    let texture = gdk::MemoryTexture::new(img.width, img.height, format, &bytes, rowstride);
     Some(texture.upcast())
 }
 
@@ -822,6 +847,55 @@ mod tests {
     fn prewarm_waits_for_scroll_quiet_period() {
         assert!(!scroll_is_quiet(1_000_000, 1_149_999));
         assert!(scroll_is_quiet(1_000_000, 1_150_000));
+    }
+
+    #[test]
+    fn notification_link_scheme_is_whitelisted() {
+        for uri in [
+            "http://example.com/a",
+            "https://example.com/a?b=1",
+            "mailto:user@example.com",
+            "HTTPS://EXAMPLE.COM",
+        ] {
+            assert!(is_allowed_link_uri(uri), "{uri} should be allowed");
+        }
+        for uri in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "custom-handler:op",
+            "ftp://example.com",
+            "no-scheme",
+            "//example.com:8080/path",
+        ] {
+            assert!(!is_allowed_link_uri(uri), "{uri} should be dropped");
+        }
+    }
+
+    fn image(width: i32, height: i32, rowstride: i32, len: usize) -> NotificationImage {
+        NotificationImage {
+            width,
+            height,
+            rowstride,
+            has_alpha: true,
+            channels: 4,
+            data: vec![0; len],
+        }
+    }
+
+    #[test]
+    fn malformed_image_data_is_rejected() {
+        // Well-formed 2x2 RGBA: 8 bytes per row, 16 total.
+        assert_eq!(validated_image_layout(&image(2, 2, 8, 16)).map(|(rs, _)| rs), Some(8));
+
+        // Negative / zero rowstride used to cast to usize::MAX and crash GTK.
+        assert!(validated_image_layout(&image(2, 2, -1, 16)).is_none());
+        assert!(validated_image_layout(&image(2, 2, 0, 16)).is_none());
+
+        // Data shorter than rowstride * height.
+        assert!(validated_image_layout(&image(2, 2, 8, 15)).is_none());
+
+        // Rowstride narrower than the pixels it must hold (2 * 4 bytes).
+        assert!(validated_image_layout(&image(2, 2, 4, 64)).is_none());
     }
 
     #[test]

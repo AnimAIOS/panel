@@ -60,6 +60,17 @@ fn run_toast_ui_regression_subprocess(test_case: &str) {
 }
 
 #[test]
+fn toast_cap_evicts_only_oldest_when_full() {
+    let order: Vec<u32> = (1..=20).collect();
+    // 20 toasts already shown, adding one more must evict exactly the oldest.
+    assert_eq!(toast_ids_to_evict(&order, MAX_TOASTS), vec![1]);
+    // Well under the cap: nothing evicted.
+    assert!(toast_ids_to_evict(&order, 5).is_empty());
+    // Faulty count larger than the order is clamped by the available IDs.
+    assert_eq!(toast_ids_to_evict(&[1, 2], MAX_TOASTS + 10), vec![1, 2]);
+}
+
+#[test]
 fn test_toast_position_parse_contract() {
     assert_eq!(
         ToastPosition::parse("top-right"),

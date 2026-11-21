@@ -359,7 +359,8 @@ pub type ModelCallback = Arc<dyn Fn(ExtWorkspaceModel) + Send + Sync>;
 
 /// State shared between the client thread and request callers.
 struct ClientShared {
-    connection: Connection,
+    /// Replaced on reconnect so requests go to the current connection.
+    live: Mutex<Option<Connection>>,
     manager: Mutex<Option<ExtWorkspaceManagerV1>>,
     handles: Mutex<HashMap<i32, ExtWorkspaceHandleV1>>,
     running: AtomicBool,
@@ -375,46 +376,18 @@ impl ExtWorkspaceClient {
     /// Connect and start tracking. Returns `None` if there is no Wayland
     /// display or the compositor lacks the protocol.
     pub fn start(on_update: ModelCallback) -> Option<Self> {
-        let connection = Connection::connect_to_env()
-            .map_err(|e| debug!("ext-workspace: no Wayland connection: {e}"))
-            .ok()?;
-        let mut queue: EventQueue<ClientState> = connection.new_event_queue();
-        let qh = queue.handle();
-        let _registry = connection.display().get_registry(&qh, ());
-
         let shared = Arc::new(ClientShared {
-            connection: connection.clone(),
+            live: Mutex::new(None),
             manager: Mutex::new(None),
             handles: Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
         });
-        let mut state = ClientState {
-            manager: None,
-            outputs: HashMap::new(),
-            output_globals: HashMap::new(),
-            groups: HashMap::new(),
-            workspaces: HashMap::new(),
-            last_model: None,
-            shared: shared.clone(),
-            on_update,
-        };
-
-        // Globals, then output names and the initial workspace burst.
-        for _ in 0..2 {
-            if let Err(e) = queue.roundtrip(&mut state) {
-                warn!("ext-workspace roundtrip failed: {e}");
-                return None;
-            }
-        }
-        if state.manager.is_none() {
-            debug!("Compositor does not advertise {MANAGER_INTERFACE}");
-            return None;
-        }
+        let (queue, state) = connect(&shared, on_update.clone())?;
 
         let thread_shared = shared.clone();
         let thread = thread::Builder::new()
             .name("ext-workspace".into())
-            .spawn(move || run_loop(queue, state, thread_shared))
+            .spawn(move || event_loop(queue, state, thread_shared, on_update))
             .ok()?;
 
         debug!("ext-workspace client started");
@@ -435,7 +408,9 @@ impl ExtWorkspaceClient {
         };
         handle.activate();
         manager.commit();
-        if let Err(e) = self.shared.connection.flush() {
+        if let Some(live) = self.shared.live.lock().as_ref()
+            && let Err(e) = live.flush()
+        {
             warn!("ext-workspace: flush failed: {e}");
         }
     }
@@ -454,9 +429,73 @@ impl Drop for ExtWorkspaceClient {
     }
 }
 
-fn run_loop(mut queue: EventQueue<ClientState>, mut state: ClientState, shared: Arc<ClientShared>) {
-    if !wayland_loop::run(&mut queue, &mut state, &shared.running, "ext-workspace") {
-        state.reset();
+/// Fresh connection, queue and state for one (re)connect. Updates `shared`
+/// only on success, so request callers never use a half-initialised connection.
+fn connect(
+    shared: &Arc<ClientShared>,
+    on_update: ModelCallback,
+) -> Option<(EventQueue<ClientState>, ClientState)> {
+    let connection = Connection::connect_to_env()
+        .map_err(|e| debug!("ext-workspace: no Wayland connection: {e}"))
+        .ok()?;
+    let mut queue: EventQueue<ClientState> = connection.new_event_queue();
+    let qh = queue.handle();
+    let _registry = connection.display().get_registry(&qh, ());
+
+    let mut state = ClientState {
+        manager: None,
+        outputs: HashMap::new(),
+        output_globals: HashMap::new(),
+        groups: HashMap::new(),
+        workspaces: HashMap::new(),
+        last_model: None,
+        shared: shared.clone(),
+        on_update,
+    };
+
+    // Globals, then output names and the initial workspace burst.
+    for _ in 0..2 {
+        if let Err(e) = queue.roundtrip(&mut state) {
+            warn!("ext-workspace roundtrip failed: {e}");
+            return None;
+        }
+    }
+    if state.manager.is_none() {
+        debug!("Compositor does not advertise {MANAGER_INTERFACE}");
+        return None;
+    }
+
+    *shared.live.lock() = Some(connection.clone());
+    Some((queue, state))
+}
+
+/// Keep the client alive across compositor restarts: on a connection error,
+/// clear published state, back off and reconnect until `running` is cleared.
+fn event_loop(
+    mut queue: EventQueue<ClientState>,
+    mut state: ClientState,
+    shared: Arc<ClientShared>,
+    on_update: ModelCallback,
+) {
+    let mut backoff_ms = wayland_loop::RECONNECT_INITIAL_MS;
+    loop {
+        let clean_stop =
+            wayland_loop::run(&mut queue, &mut state, &shared.running, "ext-workspace");
+        if !clean_stop {
+            state.reset();
+        }
+        if !shared.running.load(Ordering::SeqCst) {
+            break;
+        }
+        if !wayland_loop::reconnect_backoff(&shared.running, &mut backoff_ms) {
+            break;
+        }
+        if let Some((next_queue, next_state)) = connect(&shared, on_update.clone()) {
+            queue = next_queue;
+            state = next_state;
+            backoff_ms = wayland_loop::RECONNECT_INITIAL_MS;
+        }
+        // connect failed: keep the current (larger) backoff and try again.
     }
     debug!("ext-workspace client stopped");
 }

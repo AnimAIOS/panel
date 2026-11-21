@@ -255,19 +255,27 @@ impl VisibilityReader {
             }
             fallback = self.fallback_interval(result.as_ref());
             not_before = Instant::now() + Duration::from_millis(100);
-            let next = result.unwrap_or_default();
-            let changed = {
-                let mut current = snapshot.write();
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            };
+            let changed = Self::publish_result(snapshot, result);
             if changed {
                 let _ = sender.try_send(());
             }
+        }
+    }
+
+    /// Apply a read result to the shared snapshot. A failed read leaves the
+    /// last good snapshot in place: an empty snapshot reads as `Unknown`, which
+    /// would fail the smart-show condition and hide every bar on one timeout.
+    /// Returns whether subscribers should be notified.
+    fn publish_result(snapshot: &RwLock<Snapshot>, result: Option<Snapshot>) -> bool {
+        let Some(next) = result else {
+            return false;
+        };
+        let mut current = snapshot.write();
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
         }
     }
 
@@ -679,6 +687,22 @@ mod tests {
 
     fn bar() -> Rect {
         Rect::new(400.0, 10.0, 200.0, 32.0).unwrap()
+    }
+
+    #[test]
+    fn failed_read_keeps_the_last_good_snapshot() {
+        let snapshot = RwLock::new(Snapshot::default());
+        let mut good = Snapshot::default();
+        good.insert("eDP-1".into(), OutputWindows::default());
+
+        assert!(VisibilityReader::publish_result(&snapshot, Some(good.clone())));
+        assert_eq!(*snapshot.read(), good);
+
+        // A transient IPC failure reads as `None` and must not clear good state.
+        assert!(!VisibilityReader::publish_result(&snapshot, None));
+        assert_eq!(*snapshot.read(), good);
+        // Repeating the same good snapshot is not a change.
+        assert!(!VisibilityReader::publish_result(&snapshot, Some(good.clone())));
     }
 
     #[test]

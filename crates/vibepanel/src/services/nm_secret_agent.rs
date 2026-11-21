@@ -247,6 +247,8 @@ struct PendingSecretRequest {
 pub struct NmSecretAgent {
     /// D-Bus registration ID for the agent object.
     agent_registration_id: RefCell<Option<gio::RegistrationId>>,
+    /// Unique bus name of the running NetworkManager; only it may call us.
+    nm_owner: RefCell<Option<String>>,
     /// Requests waiting for user response, at most one per kind so a VPN and
     /// a Wi-Fi prompt can be open at the same time.
     pending: RefCell<Vec<PendingSecretRequest>>,
@@ -260,6 +262,7 @@ impl NmSecretAgent {
     fn new() -> Self {
         Self {
             agent_registration_id: RefCell::new(None),
+            nm_owner: RefCell::new(None),
             pending: RefCell::new(Vec::new()),
             last_request_id: Cell::new(0),
             vpn_enabled: Cell::new(false),
@@ -306,8 +309,8 @@ impl NmSecretAgent {
         let registration = connection
             .register_object(AGENT_PATH, &interface_info)
             .method_call(
-                move |_conn, _sender, _path, _iface, method, params, invocation| {
-                    Self::handle_method(method, params, invocation);
+                move |_conn, sender, _path, _iface, method, params, invocation| {
+                    Self::handle_method(sender, method, params, invocation);
                 },
             )
             .build();
@@ -324,10 +327,12 @@ impl NmSecretAgent {
                     connection,
                     NM_SERVICE,
                     gio::BusNameWatcherFlags::NONE,
-                    |connection, _name, _owner| {
+                    |connection, _name, owner| {
+                        *Self::global().nm_owner.borrow_mut() = Some(owner.to_string());
                         Self::register_with_agent_manager(&connection, REGISTER_RETRIES);
                     },
                     |_connection, _name| {
+                        *Self::global().nm_owner.borrow_mut() = None;
                         let ids: Vec<u64> = Self::global()
                             .pending
                             .borrow()
@@ -418,7 +423,19 @@ impl NmSecretAgent {
     }
 
     /// Dispatch incoming D-Bus method calls.
-    fn handle_method(method: &str, params: Variant, invocation: gio::DBusMethodInvocation) {
+    fn handle_method(
+        sender: Option<&str>,
+        method: &str,
+        params: Variant,
+        invocation: gio::DBusMethodInvocation,
+    ) {
+        if !caller_is_nm(sender, Self::global().nm_owner.borrow().as_deref()) {
+            invocation.return_dbus_error(
+                AGENT_ERROR_FAILED,
+                "Only NetworkManager may call this agent",
+            );
+            return;
+        }
         debug!("NmSecretAgent: method '{}' called", method);
 
         match method {
@@ -1220,6 +1237,14 @@ impl NmSecretAgent {
     }
 }
 
+/// Only the current unique owner of NetworkManager's bus name may call us.
+///
+/// Without this check, any local process could call `GetSecrets` with a crafted
+/// VPN connection and harvest the credentials the user types into our prompt.
+fn caller_is_nm(sender: Option<&str>, nm_owner: Option<&str>) -> bool {
+    sender.is_some() && sender == nm_owner
+}
+
 /// Decline a request so NetworkManager asks the next agent.
 fn no_secrets(invocation: gio::DBusMethodInvocation, reason: &str) {
     debug!("NmSecretAgent: NoSecrets: {reason}");
@@ -2003,5 +2028,16 @@ mod tests {
             HashMap::from([("key-mgmt".to_string(), "wpa-psk".to_variant())]),
         )]);
         assert!(wifi_secret_spec(&no_ssid.to_variant()).is_err());
+    }
+
+    #[test]
+    fn only_network_manager_may_call_the_agent() {
+        // D-Bus reports both the sender and the watched name owner as unique names.
+        assert!(caller_is_nm(Some(":1.42"), Some(":1.42")));
+        // A different process, a missing sender, and a not-yet-seen NM are all rejected.
+        assert!(!caller_is_nm(Some(":1.99"), Some(":1.42")));
+        assert!(!caller_is_nm(None, Some(":1.42")));
+        assert!(!caller_is_nm(Some(":1.42"), None));
+        assert!(!caller_is_nm(None, None));
     }
 }

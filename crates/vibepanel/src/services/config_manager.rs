@@ -46,6 +46,32 @@ use super::wallpaper::{detect_wallpaper, extract_theme_from_image, theme_from_so
 /// multiple events for a single save; this batches them into one reload.
 const FILE_CHANGE_DEBOUNCE_MS: u64 = 300;
 
+/// Settle delay used to confirm a config write finished before applying it.
+const CONFIG_STABILITY_DELAY_MS: u64 = 50;
+
+/// Bytes from two reads of the config file. `Some` only when both reads
+/// succeeded and returned the same bytes; a missing or changing file is dropped.
+fn stable_config_bytes(first: Option<Vec<u8>>, second: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match (first, second) {
+        (Some(a), Some(b)) if a == b => Some(a),
+        _ => None,
+    }
+}
+
+/// Whether a notify event path is the logical config path or its current target.
+fn is_config_change_path(event: &Path, logical: &Path, canonical: &Path) -> bool {
+    event == logical || event == canonical
+}
+
+/// Parent directories to watch for the config file: its logical location and its
+/// current target. Re-computing this after a symlink retarget yields a different set.
+fn compute_config_watch_dirs(logical: &Path, canonical: &Path) -> HashSet<PathBuf> {
+    [logical, canonical]
+        .into_iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect()
+}
+
 /// Polling interval (in seconds) for checking if the wallpaper changed.
 /// Only active when `mode = "auto"` and no explicit wallpaper path is set.
 const WALLPAPER_POLL_INTERVAL_SECS: u32 = 2;
@@ -947,7 +973,9 @@ impl ConfigManager {
         // Debounce events to avoid multiple reloads for a single save
         let debounce_duration = Duration::from_millis(FILE_CHANGE_DEBOUNCE_MS);
 
-        // Canonicalize the config path so we can compare with absolute paths from notify
+        // Keep the logical path and its current target: a config.toml later replaced by
+        // a symlink reports events in one parent while reloads must follow the other.
+        let config_logical = normalize_path(&config_path);
         let config_canonical = match config_path.canonicalize() {
             Ok(p) => p,
             Err(e) => {
@@ -956,11 +984,12 @@ impl ConfigManager {
             }
         };
 
-        // Compute the config watch directory before the closure captures config_canonical.
+        // Compute the watch directories before the closure captures the paths.
         let config_watch_dir = config_canonical
             .parent()
             .unwrap_or(&config_canonical)
             .to_path_buf();
+        let mut config_watch_dirs = compute_config_watch_dirs(&config_logical, &config_canonical);
 
         let style_watch_paths = Self::compute_style_watch_paths(
             crate::bar::user_css_search_paths(config_dir.as_deref()),
@@ -989,15 +1018,22 @@ impl ConfigManager {
         let callback_watched_style_paths = watched_style_paths.clone();
         let callback_needs_style_rescan = needs_style_rescan.clone();
 
+        let callback_config_logical = config_logical.clone();
         let mut debouncer =
             match new_debouncer(debounce_duration, move |res: DebounceEventResult| {
                 match res {
                     Ok(events) => {
-                        // Check if any event is for our config file
-                        let config_changed = events.iter().any(|e| e.path == config_canonical);
+                        // Re-canonicalize per event: the symlink target may have changed
+                        // since startup, and events can land on either path.
+                        let live = callback_config_logical
+                            .canonicalize()
+                            .unwrap_or_else(|_| callback_config_logical.clone());
+                        let config_changed = events.iter().any(|e| {
+                            is_config_change_path(&e.path, &callback_config_logical, &live)
+                        });
                         if config_changed {
                             debug!("Config file change detected");
-                            Self::reload_and_send(&config_canonical);
+                            Self::reload_and_send(&live);
                         }
 
                         let watched_paths = callback_watched_style_paths.read();
@@ -1025,18 +1061,18 @@ impl ConfigManager {
                 }
             };
 
-        // Watch the config file's parent directory (more reliable than watching file directly).
-        if let Err(e) = debouncer
-            .watcher()
-            .watch(&config_watch_dir, RecursiveMode::NonRecursive)
-        {
-            error!("Failed to watch config directory: {}", e);
-            return;
+        // Watch both the logical and canonical parent directories (more reliable than
+        // watching the file directly). They differ once config.toml links elsewhere.
+        for dir in &config_watch_dirs {
+            if let Err(e) = debouncer
+                .watcher()
+                .watch(dir, RecursiveMode::NonRecursive)
+            {
+                error!("Failed to watch config directory {}: {}", dir.display(), e);
+                return;
+            }
+            info!("File watcher started, watching: {}", dir.display());
         }
-        info!(
-            "File watcher started, watching: {}",
-            config_watch_dir.display()
-        );
 
         let mut failed_style_dirs = HashSet::new();
         let mut armed_style_dirs = arm_style_dirs(
@@ -1048,6 +1084,39 @@ impl ConfigManager {
         // Keep the thread alive until shutdown is signaled
         // Use shorter sleep intervals to allow responsive shutdown
         while !shutdown_flag.load(Ordering::Relaxed) {
+            // A config.toml repointed to a symlink in a third directory changes which
+            // parent must be watched. Re-canonicalize each tick, but only re-arm when
+            // the set actually changes.
+            let live_config = config_logical
+                .canonicalize()
+                .unwrap_or_else(|_| config_logical.clone());
+            let desired_config_dirs = compute_config_watch_dirs(&config_logical, &live_config);
+            if desired_config_dirs != config_watch_dirs {
+                let newly_armed: HashSet<PathBuf> = desired_config_dirs
+                    .difference(&config_watch_dirs)
+                    .filter(|dir| {
+                        match debouncer.watcher().watch(dir.as_path(), RecursiveMode::NonRecursive)
+                        {
+                            Ok(()) => {
+                                info!("Config symlink target changed; watching: {}", dir.display());
+                                true
+                            }
+                            Err(e) => {
+                                warn!("Failed to watch config directory {}: {}", dir.display(), e);
+                                false
+                            }
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                for stale in config_watch_dirs.difference(&desired_config_dirs) {
+                    debug!("Unwatching stale config directory: {}", stale.display());
+                    let _ = debouncer.watcher().unwatch(stale);
+                }
+                config_watch_dirs.retain(|dir| desired_config_dirs.contains(dir));
+                config_watch_dirs.extend(newly_armed);
+            }
+
             let mut reload_style = false;
             let force_rearm = needs_style_rescan.swap(false, Ordering::Relaxed);
             if force_rearm {
@@ -1107,7 +1176,27 @@ impl ConfigManager {
 
     /// Reload config from file and send result to GTK thread via idle_add_once.
     fn reload_and_send(path: &std::path::Path) {
-        match Config::load(path) {
+        // A slow save can emit an event after only part of the file was written. Confirm
+        // the bytes stopped changing before applying anything, or a partial `[bar]` chunk
+        // would be deep-merged over the live config and silently reset other values.
+        let first = std::fs::read(path).ok();
+        thread::sleep(Duration::from_millis(CONFIG_STABILITY_DELAY_MS));
+        let second = std::fs::read(path).ok();
+        let Some(bytes) = stable_config_bytes(first, second) else {
+            debug!("Config still changing; dropping reload");
+            return;
+        };
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(e) => {
+                let msg = format!("Config file is not valid UTF-8: {}", e);
+                warn!("{}", msg);
+                send_config_message(ConfigMessage::Error(msg));
+                return;
+            }
+        };
+
+        match Config::load_with_defaults(&content) {
             Ok(new_config) => {
                 // Validate the new config
                 if let Err(e) = new_config.validate() {
@@ -1476,6 +1565,57 @@ mod tests {
         for (name, path, expected) in cases {
             assert_eq!(normalize_path(&path), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn config_change_matches_logical_and_canonical_paths() {
+        let logical = Path::new("/home/u/.config/vibepanel/config.toml");
+        let canonical = Path::new("/home/u/dotfiles/config.toml");
+        assert!(is_config_change_path(logical, logical, canonical));
+        assert!(is_config_change_path(canonical, logical, canonical));
+        assert!(!is_config_change_path(
+            Path::new("/home/u/other.toml"),
+            logical,
+            canonical
+        ));
+    }
+
+    #[test]
+    fn config_watch_dirs_change_when_symlink_target_moves() {
+        let logical = Path::new("/home/u/.config/vibepanel/config.toml");
+        let first_target = Path::new("/home/u/dotfiles/config.toml");
+        let third_target = Path::new("/mnt/other/config.toml");
+
+        let initial = compute_config_watch_dirs(logical, logical);
+        assert_eq!(
+            initial,
+            HashSet::from([PathBuf::from("/home/u/.config/vibepanel")])
+        );
+
+        let symlinked = compute_config_watch_dirs(logical, first_target);
+        assert_ne!(symlinked, initial);
+        assert!(symlinked.contains(&PathBuf::from("/home/u/dotfiles")));
+
+        let retargeted = compute_config_watch_dirs(logical, third_target);
+        assert_ne!(retargeted, symlinked);
+        assert!(retargeted.contains(&PathBuf::from("/mnt/other")));
+        assert!(!retargeted.contains(&PathBuf::from("/home/u/dotfiles")));
+        assert!(retargeted.contains(&PathBuf::from("/home/u/.config/vibepanel")));
+    }
+
+    #[test]
+    fn unstable_config_bytes_are_dropped() {
+        let stable = b"size = 40\n".to_vec();
+        assert_eq!(
+            stable_config_bytes(Some(stable.clone()), Some(stable.clone())),
+            Some(stable)
+        );
+        assert_eq!(
+            stable_config_bytes(Some(b"a".to_vec()), Some(b"b".to_vec())),
+            None
+        );
+        assert_eq!(stable_config_bytes(Some(b"a".to_vec()), None), None);
+        assert_eq!(stable_config_bytes(None, None), None);
     }
 
     #[test]
