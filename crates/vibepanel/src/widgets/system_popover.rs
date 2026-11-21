@@ -37,6 +37,7 @@ use gtk4::{
 };
 use tr::tr;
 
+use crate::services::array::ArrayInfo;
 use crate::services::callbacks::CallbackId;
 use crate::services::config_manager::ConfigManager;
 use crate::services::gpu::{
@@ -78,6 +79,10 @@ struct DriveRow {
     bar: ProgressBar,
     detail_label: Label,
     usage_label: Label,
+    /// Nested per-device rows for multi-device filesystems.
+    device_rows: GtkBox,
+    /// Signature of the devices currently rendered in `device_rows`.
+    device_signature: Rc<RefCell<String>>,
 }
 
 #[derive(Clone)]
@@ -362,8 +367,22 @@ impl SystemPopoverController {
                 "disk-symbolic"
             });
             row.mount_label.set_label(&mount.mount_point);
-            row.detail_label
-                .set_label(&format!("{} · {}", mount.device, mount.fs_type));
+            match &mount.array {
+                Some(info) => {
+                    update_array_devices(row, info);
+                    row.detail_label.set_label(&array_detail(info));
+                }
+                None => {
+                    if !row.device_signature.borrow().is_empty() {
+                        *row.device_signature.borrow_mut() = String::new();
+                        while let Some(child) = row.device_rows.first_child() {
+                            row.device_rows.remove(&child);
+                        }
+                    }
+                    row.detail_label
+                        .set_label(&format!("{} · {}", mount.device, mount.fs_type));
+                }
+            }
             row.bar.set_visible(mount.usage.is_some());
             let Some(usage) = mount.usage else {
                 // Still mounted, but its usage could not be read.
@@ -551,6 +570,11 @@ fn build_drive_row() -> (GtkBox, DriveRow) {
     footer.append(&usage_label);
     container.append(&footer);
 
+    let device_rows = GtkBox::new(Orientation::Vertical, 6);
+    device_rows.set_margin_start(24);
+    device_rows.set_margin_top(2);
+    container.append(&device_rows);
+
     let row = DriveRow {
         icon,
         mount_label,
@@ -558,8 +582,116 @@ fn build_drive_row() -> (GtkBox, DriveRow) {
         bar,
         detail_label,
         usage_label,
+        device_rows,
+        device_signature: Rc::new(RefCell::new(String::new())),
     };
     (container, row)
+}
+
+/// Summary shown on a multi-device mount row: filesystem, device count,
+/// redundancy and health.
+fn array_detail(info: &ArrayInfo) -> String {
+    let redundancy = info
+        .redundancy
+        .clone()
+        .unwrap_or_else(|| tr!("single").to_string());
+    let health = if info.degraded {
+        tr!("degraded")
+    } else {
+        tr!("healthy")
+    };
+    tr!(
+        "{kind} · {count} device · {redundancy} · {health}"
+            | "{kind} · {count} devices · {redundancy} · {health}" % info.devices.len(),
+        kind = info.kind.name(),
+        count = info.devices.len(),
+        redundancy = redundancy,
+        health = health
+    )
+    .to_string()
+}
+
+/// Identity of the rendered device rows, so they are rebuilt only when the
+/// devices or their reported state change.
+fn array_device_signature(info: &ArrayInfo) -> String {
+    std::iter::once(info.kind.name().to_string())
+        .chain(info.devices.iter().map(|device| {
+            format!(
+                "{}|{}|{}|{}|{}|{:?}",
+                device.label,
+                device.device,
+                device.state,
+                device.size,
+                device.used,
+                device.use_percent
+            )
+        }))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render one compact row per device of an array, rebuilding only when the
+/// devices or their reported state change.
+fn update_array_devices(row: &DriveRow, info: &ArrayInfo) {
+    let signature = array_device_signature(info);
+    if *row.device_signature.borrow() == signature {
+        return;
+    }
+    *row.device_signature.borrow_mut() = signature;
+
+    while let Some(child) = row.device_rows.first_child() {
+        row.device_rows.remove(&child);
+    }
+
+    for device in &info.devices {
+        let container = GtkBox::new(Orientation::Vertical, 2);
+
+        let header = GtkBox::new(Orientation::Horizontal, 6);
+        let name = Label::new(Some(&format!("{} · {}", device.label, device.device)));
+        name.add_css_class(color::MUTED);
+        name.set_halign(Align::Start);
+        name.set_xalign(0.0);
+        name.set_hexpand(true);
+        name.set_ellipsize(EllipsizeMode::End);
+        header.append(&name);
+
+        let state = Label::new(Some(&device.state));
+        state.add_css_class(color::MUTED);
+        if device.state != "rw" {
+            state.add_css_class(color::ERROR);
+        }
+        header.append(&state);
+
+        let percent = Label::new(Some(
+            &device
+                .use_percent
+                .map(|value| format!("{value}%"))
+                .unwrap_or_else(|| "--".to_string()),
+        ));
+        percent.set_width_chars(4);
+        percent.set_xalign(1.0);
+        header.append(&percent);
+        container.append(&header);
+
+        if let Some(fraction) = device.use_percent {
+            let bar = ProgressBar::new();
+            bar.add_css_class(sp::PROGRESS_BAR);
+            bar.set_fraction(f64::from(fraction) / 100.0);
+            container.append(&bar);
+        }
+
+        set_tooltip(
+            &container,
+            Some(&tr!(
+                "{device}: {used} / {size} ({state})",
+                device = device.device,
+                used = format_bytes_long(device.used),
+                size = format_bytes_long(device.size),
+                state = device.state
+            )),
+        );
+        row.device_rows.append(&container);
+    }
 }
 
 fn section_title_with_values(
@@ -1164,7 +1296,11 @@ pub(crate) fn wire_system_popover_for_menu(menu_handle: &Rc<crate::widgets::base
 
 #[cfg(test)]
 mod tests {
-    use super::{gpu_clock_fraction, gpu_power_fraction, headline_mount};
+    use super::{
+        array_detail, array_device_signature, build_drive_row, gpu_clock_fraction,
+        gpu_power_fraction, headline_mount, update_array_devices,
+    };
+    use crate::services::array::{ArrayDevice, ArrayInfo, ArrayKind};
     use crate::services::gpu::GpuDeviceSnapshot;
     use crate::services::system::{MountUsage, SpaceUsage};
 
@@ -1207,5 +1343,110 @@ mod tests {
         };
         assert!(gpu_power_fraction(&snapshot).is_some_and(|value| (value - 0.4).abs() < 0.001));
         assert_eq!(gpu_clock_fraction(&snapshot), Some(0.6));
+    }
+
+    fn array(kind: ArrayKind, degraded: bool) -> ArrayInfo {
+        ArrayInfo {
+            devices: vec![
+                ArrayDevice {
+                    label: "ultra_fast (device 2)".into(),
+                    device: "nvme0n1p2".into(),
+                    state: "rw".into(),
+                    use_percent: Some(56),
+                    ..Default::default()
+                },
+                ArrayDevice {
+                    label: "sata_ssd (device 6)".into(),
+                    device: "sda".into(),
+                    state: "rw".into(),
+                    use_percent: Some(39),
+                    ..Default::default()
+                },
+            ],
+            redundancy: Some("2x".into()),
+            degraded,
+            kind,
+        }
+    }
+
+    #[test]
+    fn test_array_detail_shows_kind_count_redundancy_and_health() {
+        let detail = array_detail(&array(ArrayKind::Bcachefs, false));
+        assert!(detail.contains("bcachefs"), "{detail}");
+        assert!(detail.contains("2 devices"), "{detail}");
+        assert!(detail.contains("2x"), "{detail}");
+        assert!(detail.contains("healthy"), "{detail}");
+
+        let mut btrfs = array(ArrayKind::Btrfs, false);
+        btrfs.redundancy = Some("RAID1".into());
+        let btrfs_detail = array_detail(&btrfs);
+        assert!(btrfs_detail.contains("btrfs"), "{btrfs_detail}");
+        assert!(btrfs_detail.contains("RAID1"), "{btrfs_detail}");
+
+        let degraded = array_detail(&array(ArrayKind::Btrfs, true));
+        assert!(degraded.contains("degraded"), "{degraded}");
+    }
+
+    #[test]
+    fn test_array_detail_uses_singular_and_plural_device_count() {
+        let mut single = array(ArrayKind::Btrfs, false);
+        single.devices.pop();
+        let detail = array_detail(&single);
+        assert!(detail.contains("1 device"), "{detail}");
+        assert!(!detail.contains("1 devices"), "{detail}");
+
+        let detail = array_detail(&array(ArrayKind::Btrfs, false));
+        assert!(detail.contains("2 devices"), "{detail}");
+    }
+
+    #[test]
+    fn test_array_device_signature_tracks_device_state() {
+        let info = array(ArrayKind::Btrfs, false);
+        let signature = array_device_signature(&info);
+        assert_eq!(signature, array_device_signature(&info));
+
+        let mut changed = info.clone();
+        changed.devices[0].state = "offline".into();
+        assert_ne!(signature, array_device_signature(&changed));
+
+        let mut changed = info;
+        changed.devices.pop();
+        assert_ne!(signature, array_device_signature(&changed));
+    }
+
+    #[test]
+    #[ignore = "UI regression test: requires a GTK display; run under Xvfb"]
+    fn test_ui_regression_array_device_rows() {
+        use gtk4::prelude::*;
+
+        use crate::ui_regression_test_support::{flush_gtk, init_gtk_or_skip};
+
+        if !init_gtk_or_skip("array device rows UI test") {
+            return;
+        }
+
+        let (_container, row) = build_drive_row();
+        let info = array(ArrayKind::Bcachefs, false);
+        update_array_devices(&row, &info);
+        flush_gtk();
+
+        assert_eq!(row.device_rows.observe_children().n_items(), 2);
+
+        // Re-rendering an unchanged array keeps the same widget instances.
+        let first_child = row.device_rows.first_child();
+        update_array_devices(&row, &info);
+        assert!(
+            first_child
+                .as_ref()
+                .is_some_and(|child| Some(child) == row.device_rows.first_child().as_ref())
+        );
+
+        // A changed device state rebuilds the rows.
+        let mut changed = info;
+        changed.devices[0].state = "offline".into();
+        update_array_devices(&row, &changed);
+        flush_gtk();
+        assert_eq!(row.device_rows.observe_children().n_items(), 2);
+        assert!(first_child != row.device_rows.first_child());
     }
 }

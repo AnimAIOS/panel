@@ -23,7 +23,8 @@ use std::fs;
 use std::hash::Hash;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::rc::Rc;
+use std::process::{Command, Stdio};
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use gtk4::gio;
@@ -31,6 +32,9 @@ use gtk4::glib::{self, SourceId};
 use sysinfo::{Components, CpuRefreshKind, MemoryRefreshKind, Networks, RefreshKind, System};
 use tracing::{debug, trace};
 
+use super::array::ArrayInfo;
+use super::bcachefs::parse_bcachefs_usage;
+use super::btrfs::{merge_btrfs_usage, parse_btrfs_show};
 use super::callbacks::{CallbackId, Callbacks};
 use super::sleep_watcher::SleepWatcher;
 
@@ -108,6 +112,8 @@ pub struct MountUsage {
     pub removable: bool,
     /// `None` if its usage could not be read (e.g. the query is hung).
     pub usage: Option<SpaceUsage>,
+    /// Array details for multi-device filesystems, when available.
+    pub array: Option<ArrayInfo>,
 }
 
 /// Space usage of a filesystem, in bytes.
@@ -372,6 +378,7 @@ fn discover_mounts() -> Vec<(Vec<u8>, MountUsage)> {
                 fs_type,
                 removable,
                 usage: None,
+                array: None,
             };
             (mount_point, mount)
         })
@@ -382,6 +389,24 @@ type PathUsage = HashMap<String, Option<SpaceUsage>>;
 
 /// How long a filesystem query may run before its result is shown as unavailable.
 const STORAGE_STALE_AFTER: Duration = Duration::from_secs(10);
+
+/// How often multi-device array details are refreshed. The filesystem commands
+/// are subprocesses, so they run much less often than space-usage queries.
+const ARRAY_QUERY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a single filesystem command may run before it is killed and its
+/// result treated as unavailable. Without this, a degraded or wedged array
+/// could hang `Command::output()` forever.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often to poll a child process while waiting for it to exit.
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Last-resort bound for a whole array refresh. Each subprocess is already
+/// bounded by [`COMMAND_TIMEOUT`], but this guarantees the refresh future (and
+/// its [`ArrayQueryGuard`]) finishes even if a query wedges in an unexpected
+/// way, so `array_querying` can never stay set forever.
+const ARRAY_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One watched filesystem: its watcher count, when its running query started,
 /// and its last result (`None` until the first query finishes).
@@ -486,6 +511,7 @@ fn published_storage(
     drives: &[(Vec<u8>, MountUsage)],
     mount_usage: &WatchedPaths<Vec<u8>>,
     paths: &WatchedPaths<String>,
+    arrays: &HashMap<String, ArrayInfo>,
     now: Instant,
 ) -> (Vec<MountUsage>, PathUsage) {
     let mounts = drives
@@ -494,6 +520,7 @@ fn published_storage(
             let usage = mount_usage.get(key, now)?;
             (usage.is_none_or(|usage| usage.total > 0)).then(|| MountUsage {
                 usage,
+                array: arrays.get(&mount.mount_point).cloned(),
                 ..mount.clone()
             })
         })
@@ -524,6 +551,153 @@ fn statvfs_usage(path: &[u8]) -> Option<SpaceUsage> {
         used: total.saturating_sub(free),
         available: stat.f_bavail * block,
     })
+}
+
+/// Run the filesystem-specific command for each mount and collect the parsed
+/// details. Runs on a GIO worker thread; failures are logged and skipped.
+fn query_arrays(mounts: &[(String, String)]) -> HashMap<String, ArrayInfo> {
+    let mut infos = HashMap::new();
+    for (mount, fs_type) in mounts {
+        let info = match fs_type.as_str() {
+            "bcachefs" => query_bcachefs(mount),
+            "btrfs" => query_btrfs(mount),
+            _ => None,
+        };
+        if let Some(info) = info {
+            debug!(
+                "SystemService: {fs_type} {mount} has {} devices",
+                info.devices.len()
+            );
+            infos.insert(mount.clone(), info);
+        }
+    }
+    infos
+}
+
+/// Run a command and return its stdout, logging any failure. A missing command
+/// or a degraded array that refuses the query is treated as "no details".
+///
+/// `Command::output()` has no timeout, so a hung filesystem command (e.g. a
+/// wedged array or stuck member device) would block forever. Instead spawn the
+/// child and poll `try_wait` against a deadline, killing it on timeout. This
+/// bounds every query without needing an extra thread per command.
+fn command_output(command: &str, args: &[&str]) -> Option<String> {
+    command_output_with_timeout(command, args, COMMAND_TIMEOUT)
+}
+
+/// Same as [`command_output`] but with a caller-supplied deadline, which lets
+/// tests exercise the timeout without waiting the full [`COMMAND_TIMEOUT`].
+fn command_output_with_timeout(command: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = match Command::new(command)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            debug!("SystemService: cannot run {command}: {err}");
+            return None;
+        }
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(err) => {
+                debug!(
+                    "SystemService: {command} {} wait failed: {err}",
+                    args.join(" ")
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            debug!(
+                "SystemService: {command} {} timed out after {:?}",
+                args.join(" "),
+                timeout
+            );
+            let _ = child.kill();
+            let _ = child.wait(); // reap the killed child
+            return None;
+        }
+        std::thread::sleep(COMMAND_POLL_INTERVAL);
+    }
+
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => match String::from_utf8(output.stdout) {
+            Ok(text) => Some(text),
+            Err(_) => {
+                debug!("SystemService: {command} output is not UTF-8");
+                None
+            }
+        },
+        Ok(output) => {
+            debug!(
+                "SystemService: {command} {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            None
+        }
+        Err(err) => {
+            debug!(
+                "SystemService: {command} {} output failed: {err}",
+                args.join(" ")
+            );
+            None
+        }
+    }
+}
+
+fn query_bcachefs(mount: &str) -> Option<ArrayInfo> {
+    command_output("bcachefs", &["fs", "usage", mount])
+        .and_then(|text| parse_bcachefs_usage(&text))
+        .map(ArrayInfo::from)
+}
+
+fn query_btrfs(mount: &str) -> Option<ArrayInfo> {
+    let show = command_output("btrfs", &["filesystem", "show", mount])?;
+    let mut info = parse_btrfs_show(&show)?;
+    // The profile line is a nice-to-have: an older btrfs-progs without `-b`
+    // still gives us the device table and health from `show`.
+    if let Some(usage) = command_output("btrfs", &["filesystem", "usage", "-b", mount]) {
+        merge_btrfs_usage(&mut info, &usage);
+    }
+    Some(info.into())
+}
+
+/// Reconcile the retained array details with the current set of multi-device
+/// mounts: a successful query replaces the previous entry, a failed one keeps
+/// it, and mount points that are no longer arrays are dropped. Cached details
+/// are only kept while the filesystem at that mount point is unchanged: if the
+/// mount was reused by a different filesystem whose query fails (e.g. the tool
+/// is missing), the stale entry is dropped instead of shown forever.
+///
+/// `mount_fs_types` maps each current array mount point to its filesystem type.
+/// Returns the new map and whether it differs from `existing`.
+fn merge_arrays(
+    existing: &HashMap<String, ArrayInfo>,
+    fresh: HashMap<String, ArrayInfo>,
+    mount_fs_types: &HashMap<String, String>,
+) -> (HashMap<String, ArrayInfo>, bool) {
+    let merged: HashMap<String, ArrayInfo> = mount_fs_types
+        .iter()
+        .filter_map(|(mount, fs_type)| {
+            let cached = existing
+                .get(mount)
+                .filter(|info| info.kind.name() == fs_type.as_str());
+            let info = fresh.get(mount).or(cached)?;
+            Some((mount.clone(), info.clone()))
+        })
+        .collect();
+    let changed = merged != *existing;
+    (merged, changed)
 }
 
 /// Shared, process-wide system monitoring service.
@@ -570,11 +744,31 @@ pub struct SystemService {
     /// Usage of each discovered drive, queried independently.
     mount_usage: RefCell<WatchedPaths<Vec<u8>>>,
 
+    /// Multi-device array details, keyed by mount point.
+    arrays: RefCell<HashMap<String, ArrayInfo>>,
+
+    /// Time of the last array query and whether one is still running.
+    array_queried_at: Cell<Option<Instant>>,
+    array_querying: Cell<bool>,
+
     /// A mount discovery is running.
     discovering: Cell<bool>,
 
     /// Paths watched by disk widgets, queried independently.
     watched_paths: RefCell<WatchedPaths<String>>,
+}
+
+/// Clears `array_querying` when an array-refresh future finishes, is dropped,
+/// or its query panics. Holding the flag behind a `Drop` guard means a hung or
+/// failed query can never leave `refresh_arrays` permanently short-circuited.
+struct ArrayQueryGuard(Weak<SystemService>);
+
+impl Drop for ArrayQueryGuard {
+    fn drop(&mut self) {
+        if let Some(this) = self.0.upgrade() {
+            this.array_querying.set(false);
+        }
+    }
 }
 
 impl SystemService {
@@ -609,6 +803,9 @@ impl SystemService {
             poll_interval: Cell::new(DEFAULT_POLL_INTERVAL_SECS),
             drives: RefCell::new(Vec::new()),
             mount_usage: RefCell::new(WatchedPaths::default()),
+            arrays: RefCell::new(HashMap::new()),
+            array_queried_at: Cell::new(None),
+            array_querying: Cell::new(false),
             discovering: Cell::new(false),
             watched_paths: RefCell::new(WatchedPaths::default()),
         });
@@ -680,6 +877,7 @@ impl SystemService {
     /// Rediscover mounts and query every idle mount and watched path, each on
     /// its own thread. Results are shown on the next poll.
     fn refresh_storage(this: &Rc<Self>) {
+        Self::refresh_arrays(this);
         Self::query_all(this, |this| &this.watched_paths);
         if this.discovering.replace(true) {
             return;
@@ -698,6 +896,93 @@ impl SystemService {
             this.mount_usage.borrow_mut().sync(&keys);
             *this.drives.borrow_mut() = drives;
             Self::query_all(&this, |this| &this.mount_usage);
+        });
+    }
+
+    /// Refresh per-device details for multi-device mounts, at most one query at
+    /// a time and no more often than [`ARRAY_QUERY_INTERVAL`].
+    ///
+    /// The commands are optional: a mount whose query fails or cannot be parsed
+    /// keeps its previous details, while a successful query replaces them.
+    /// Details for mount points that are no longer arrays are dropped, and
+    /// nothing is shown for mounts that never returned a result.
+    fn refresh_arrays(this: &Rc<Self>) {
+        let mounts: Vec<(String, String)> = this
+            .drives
+            .borrow()
+            .iter()
+            .filter(|(_, mount)| matches!(mount.fs_type.as_str(), "bcachefs" | "btrfs"))
+            .map(|(_, mount)| (mount.mount_point.clone(), mount.fs_type.clone()))
+            .collect();
+        let mount_fs_types: HashMap<String, String> = mounts.iter().cloned().collect();
+
+        // No multi-device mounts: prune any stale details so a different
+        // filesystem later reusing the same path cannot show them. Skip the
+        // notification when the map is already empty to avoid needless redraws.
+        if mount_fs_types.is_empty() {
+            let removed = {
+                let mut arrays = this.arrays.borrow_mut();
+                let removed = !arrays.is_empty();
+                arrays.clear();
+                removed
+            };
+            if removed {
+                this.apply_storage(&mut this.snapshot.borrow_mut());
+                this.callbacks.notify(&this.snapshot.borrow());
+            }
+            return;
+        }
+
+        if this.array_querying.get()
+            || this
+                .array_queried_at
+                .get()
+                .is_some_and(|at| at.elapsed() < ARRAY_QUERY_INTERVAL)
+        {
+            return;
+        }
+
+        this.array_querying.set(true);
+        this.array_queried_at.set(Some(Instant::now()));
+        let weak = Rc::downgrade(this);
+        let guard = ArrayQueryGuard(weak.clone());
+        glib::spawn_future_local(async move {
+            // The guard clears `array_querying` on every exit path, including a
+            // timeout, an early return, or a panic while querying.
+            let _guard = guard;
+            let (tx, rx) = async_channel::bounded::<Option<HashMap<String, ArrayInfo>>>(1);
+            // A glib timer is a last-resort wake-up: even if a query wedges
+            // despite the per-command timeouts, the receive below resolves and
+            // the guard can release the flag.
+            let timeout_tx = tx.clone();
+            let timeout_source = glib::timeout_add_local_once(ARRAY_QUERY_TIMEOUT, move || {
+                let _ = timeout_tx.try_send(None);
+            });
+            // Subprocess queries are slow; use a dedicated thread instead of
+            // occupying a worker in GIO's shared pool (see `query_all`).
+            let spawned = std::thread::Builder::new()
+                .name("vp-array".into())
+                .spawn(move || {
+                    let _ = tx.send_blocking(Some(query_arrays(&mounts)));
+                });
+            let fresh = match spawned {
+                Ok(_) => rx.recv().await.ok().flatten(),
+                Err(_) => None,
+            };
+            timeout_source.remove();
+
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            let (merged, changed) = {
+                let existing = this.arrays.borrow();
+                merge_arrays(&existing, fresh.unwrap_or_default(), &mount_fs_types)
+            };
+            if changed {
+                *this.arrays.borrow_mut() = merged;
+                this.apply_storage(&mut this.snapshot.borrow_mut());
+                this.callbacks.notify(&this.snapshot.borrow());
+            }
         });
     }
 
@@ -743,6 +1028,7 @@ impl SystemService {
             &self.drives.borrow(),
             &self.mount_usage.borrow(),
             &self.watched_paths.borrow(),
+            &self.arrays.borrow(),
             Instant::now(),
         );
     }
@@ -1149,6 +1435,146 @@ mod tests {
         path.to_string()
     }
 
+    fn mounts(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(mount, fs_type)| (key(mount), fs_type.to_string()))
+            .collect()
+    }
+
+    fn array_info(devices: usize, kind: crate::services::array::ArrayKind) -> ArrayInfo {
+        ArrayInfo {
+            devices: (0..devices)
+                .map(|index| crate::services::array::ArrayDevice {
+                    label: format!("devid {index}"),
+                    ..Default::default()
+                })
+                .collect(),
+            redundancy: None,
+            degraded: false,
+            kind,
+        }
+    }
+
+    #[test]
+    fn test_merge_arrays_keeps_old_entry_on_transient_failure() {
+        use crate::services::array::ArrayKind;
+
+        let existing = HashMap::from([(key("/mnt/array"), array_info(2, ArrayKind::Btrfs))]);
+        let current = mounts(&[("/mnt/array", "btrfs")]);
+
+        // A failed/unparseable query yields no fresh entry: retain the old one.
+        let (merged, changed) = merge_arrays(&existing, HashMap::new(), &current);
+        assert_eq!(merged, existing);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_merge_arrays_replaces_entry_on_success() {
+        use crate::services::array::ArrayKind;
+
+        let existing = HashMap::from([(key("/mnt/array"), array_info(2, ArrayKind::Bcachefs))]);
+        let current = mounts(&[("/mnt/array", "bcachefs")]);
+        let fresh = HashMap::from([(key("/mnt/array"), array_info(3, ArrayKind::Bcachefs))]);
+
+        let (merged, changed) = merge_arrays(&existing, fresh, &current);
+        assert_eq!(
+            merged.get("/mnt/array").map(|info| info.devices.len()),
+            Some(3)
+        );
+        assert!(changed);
+    }
+
+    #[test]
+    fn test_merge_arrays_prunes_removed_mount() {
+        use crate::services::array::ArrayKind;
+
+        let existing = HashMap::from([
+            (key("/mnt/a"), array_info(2, ArrayKind::Btrfs)),
+            (key("/mnt/b"), array_info(3, ArrayKind::Btrfs)),
+        ]);
+        let current = mounts(&[("/mnt/a", "btrfs")]);
+        let fresh = HashMap::from([(key("/mnt/a"), array_info(4, ArrayKind::Btrfs))]);
+
+        let (merged, changed) = merge_arrays(&existing, fresh, &current);
+        assert_eq!(merged.get("/mnt/a").map(|info| info.devices.len()), Some(4));
+        assert!(!merged.contains_key("/mnt/b"));
+        assert!(changed);
+
+        // No mounts at all clears everything, reporting a change only once.
+        let (empty, changed) = merge_arrays(&merged, HashMap::new(), &HashMap::new());
+        assert!(empty.is_empty());
+        assert!(changed);
+        let (empty, changed) = merge_arrays(&empty, HashMap::new(), &HashMap::new());
+        assert!(empty.is_empty());
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_merge_arrays_prunes_entry_when_fs_type_changes() {
+        use crate::services::array::ArrayKind;
+
+        // /mnt/data used to be btrfs; it is now bcachefs whose query fails
+        // (e.g. bcachefs-tools is not installed). The stale btrfs entry must
+        // be dropped instead of being kept by the failure fallback.
+        let existing = HashMap::from([(key("/mnt/data"), array_info(2, ArrayKind::Btrfs))]);
+        let current = mounts(&[("/mnt/data", "bcachefs")]);
+
+        let (merged, changed) = merge_arrays(&existing, HashMap::new(), &current);
+        assert!(merged.is_empty());
+        assert!(changed);
+
+        // A successful query for the new filesystem still replaces the entry.
+        let fresh = HashMap::from([(key("/mnt/data"), array_info(3, ArrayKind::Bcachefs))]);
+        let (merged, changed) = merge_arrays(&existing, fresh, &current);
+        assert_eq!(
+            merged.get("/mnt/data").map(|info| info.kind),
+            Some(ArrayKind::Bcachefs)
+        );
+        assert!(changed);
+
+        // Details for other, unchanged mounts are not affected.
+        let existing = HashMap::from([
+            (key("/mnt/data"), array_info(2, ArrayKind::Btrfs)),
+            (key("/mnt/keep"), array_info(4, ArrayKind::Btrfs)),
+        ]);
+        let current = mounts(&[("/mnt/data", "bcachefs"), ("/mnt/keep", "btrfs")]);
+        let (merged, changed) = merge_arrays(&existing, HashMap::new(), &current);
+        assert!(!merged.contains_key("/mnt/data"));
+        assert_eq!(
+            merged.get("/mnt/keep").map(|info| info.devices.len()),
+            Some(4)
+        );
+        assert!(changed);
+    }
+
+    #[test]
+    fn test_merge_arrays_no_change_returns_false() {
+        use crate::services::array::ArrayKind;
+
+        let existing = HashMap::from([(key("/mnt/array"), array_info(2, ArrayKind::Bcachefs))]);
+        let current = mounts(&[("/mnt/array", "bcachefs")]);
+        let fresh = existing.clone();
+
+        let (merged, changed) = merge_arrays(&existing, fresh, &current);
+        assert_eq!(merged, existing);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_command_output_kills_hung_child_on_timeout() {
+        let started = Instant::now();
+        // `sleep` never writes output and would block forever without the
+        // deadline; the child must be killed and `None` returned promptly.
+        let result = command_output_with_timeout("sleep", &["30"], Duration::from_millis(200));
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // A command that exits successfully still returns its output.
+        let result = command_output_with_timeout("printf", &["hello"], COMMAND_TIMEOUT);
+        assert_eq!(result.as_deref(), Some("hello"));
+    }
+
     #[test]
     fn test_watched_paths_isolate_hung_queries() {
         let now = Instant::now();
@@ -1189,7 +1615,8 @@ mod tests {
             (path.as_bytes().to_vec(), mount)
         };
         let listed = |drives: &[(Vec<u8>, MountUsage)], usage: &WatchedPaths<Vec<u8>>, at| {
-            let (mounts, _) = published_storage(drives, usage, &WatchedPaths::default(), at);
+            let (mounts, _) =
+                published_storage(drives, usage, &WatchedPaths::default(), &HashMap::new(), at);
             mounts
                 .into_iter()
                 .map(|mount| (mount.mount_point, mount.usage.map(|usage| usage.total)))

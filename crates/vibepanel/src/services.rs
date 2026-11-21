@@ -25,13 +25,16 @@
 mod wayland;
 pub use wayland::{activation, background_effect, idle_inhibit};
 
+pub mod array;
 pub mod audio;
 pub mod bar_manager;
 pub mod bar_visibility;
 pub mod battery;
 pub mod battery_alert;
+pub mod bcachefs;
 pub mod bluetooth;
 pub mod brightness;
+pub mod btrfs;
 pub mod calendar;
 pub mod callbacks;
 pub mod cava;
